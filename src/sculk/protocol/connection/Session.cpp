@@ -14,7 +14,6 @@
 #include <RakNetStatistics.h>
 #include <chrono>
 #include <mutex>
-#include <thread>
 
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
@@ -106,8 +105,8 @@ Session::~Session() { disconnect(); }
 bool Session::isCompressed() const noexcept { return mCompressionType.has_value(); }
 
 void Session::setCompressed(CompressionAlgorithm type, std::int32_t threshold) noexcept {
-    (void)flushUnlocked();
     std::scoped_lock lock{mMutex};
+    (void)flushPendingBeforeStateChangeUnlocked();
     mCompressionType      = type;
     mCompressionThreshold = threshold;
 }
@@ -115,8 +114,8 @@ void Session::setCompressed(CompressionAlgorithm type, std::int32_t threshold) n
 bool Session::isEncrypted() const noexcept { return mEncryption.has_value(); }
 
 void Session::setEncrypted(std::vector<std::byte>&& key) noexcept {
-    (void)flushUnlocked();
     std::scoped_lock lock{mMutex};
+    (void)flushPendingBeforeStateChangeUnlocked();
     mEncryption.emplace(std::move(key));
 }
 
@@ -189,9 +188,29 @@ bool Session::sendPacketImmediately(BufferView buffer) {
 }
 
 bool Session::flush() {
-    std::scoped_lock lock{mMutex}; // TODO: ??
-    mNextFlushAt = std::chrono::steady_clock::now() + FLUSH_INTERVAL;
-    return flushUnlocked();
+    OutboundBuffers outPackets{};
+
+    {
+        std::scoped_lock lock{mMutex};
+        mNextFlushAt = std::chrono::steady_clock::now() + FLUSH_INTERVAL;
+        if (!dequeueOutboundUnlocked(outPackets)) {
+            return false;
+        }
+    }
+
+    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
+        return false;
+    }
+
+    Buffer       packetsBuffer{};
+    BinaryStream packetStream{packetsBuffer};
+
+    for (const auto& buf : outPackets) {
+        packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(buf.size()));
+        packetStream.writeBytes(buf.data(), buf.size());
+    }
+
+    return sendBatchedBufferImmediately(std::move(packetsBuffer));
 }
 
 bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
@@ -199,21 +218,42 @@ bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
         return false;
     }
 
-    if (now < mNextFlushAt) {
+    OutboundBuffers outPackets{};
+
+    {
+        std::scoped_lock lock{mMutex};
+
+        if (now < mNextFlushAt) {
+            return false;
+        }
+
+        mNextFlushAt = now + FLUSH_INTERVAL;
+        if (!dequeueOutboundUnlocked(outPackets)) {
+            return false;
+        }
+    }
+
+    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
         return false;
     }
 
-    std::scoped_lock lock{mMutex};
-    mNextFlushAt = now + FLUSH_INTERVAL;
-    return flushUnlocked();
+    Buffer       packetsBuffer{};
+    BinaryStream packetStream{packetsBuffer};
+
+    for (const auto& buf : outPackets) {
+        packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(buf.size()));
+        packetStream.writeBytes(buf.data(), buf.size());
+    }
+
+    return sendBatchedBufferImmediately(std::move(packetsBuffer));
 }
 
-bool Session::flushUnlocked() {
-    if (!mConnected.load(std::memory_order_relaxed) || !hasPendingOutboundPackets() || !mPeer) {
+bool Session::dequeueOutboundUnlocked(OutboundBuffers& outPackets) noexcept {
+    if (!mConnected.load(std::memory_order_relaxed) || !mPeer || mOutboundPackets.empty()) {
         return false;
     }
 
-    std::vector<Buffer> outPackets{};
+    outPackets.clear();
     outPackets.reserve(mOutboundPackets.size());
 
     while (!mOutboundPackets.empty()) {
@@ -224,7 +264,12 @@ bool Session::flushUnlocked() {
         outPackets.push_back(std::move(packet));
     }
 
-    if (outPackets.empty()) {
+    return !outPackets.empty();
+}
+
+bool Session::flushPendingBeforeStateChangeUnlocked() noexcept {
+    OutboundBuffers outPackets{};
+    if (!dequeueOutboundUnlocked(outPackets)) {
         return false;
     }
 
@@ -250,22 +295,6 @@ bool Session::receivePacket(Buffer& outBuffer) noexcept {
 
     outBuffer = std::move(packet);
     return true;
-}
-
-
-coro::Task<Result<Session::Buffer>> Session::receivePacketAsync() {
-    Buffer output{};
-    while (true) {
-        if (!isConnected()) {
-            co_return error_utils::makeError("session disconnected");
-        }
-
-        if (receivePacket(output)) {
-            co_return std::move(output);
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
 }
 
 bool Session::sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept {
@@ -418,10 +447,6 @@ void Session::disconnect() noexcept {
 
     {
         std::scoped_lock lock{mMutex};
-        mCompressionThreshold = 0;
-        mCompressionType.reset();
-        mEncryption.reset();
-
         while (!mOutboundPackets.empty()) {
             auto drainedOutbound = std::move(mOutboundPackets.front());
             mOutboundPackets.pop_front();

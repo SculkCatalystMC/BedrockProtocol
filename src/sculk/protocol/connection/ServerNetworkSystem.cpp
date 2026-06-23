@@ -15,15 +15,14 @@
 #include <chrono>
 #include <cstring>
 #include <format>
-#include <thread>
+#include <functional>
 
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 namespace {
 
 constexpr std::uint8_t MINECRAFT_BATCH_PACKET_ID = 0xFE;
-constexpr auto         RECEIVE_TICK_INTERVAL     = std::chrono::milliseconds(1);
-constexpr auto         FLUSH_TICK_INTERVAL       = std::chrono::milliseconds(1);
+constexpr auto         IO_PUMP_IDLE_WAIT         = std::chrono::milliseconds(1);
 constexpr std::size_t  FLUSH_WINDOW_TICKS        = 20;
 
 [[nodiscard]] std::size_t flushBudgetPerTick(std::size_t sessionsCount) noexcept {
@@ -40,13 +39,15 @@ ServerNetworkSystem::ServerNetworkSystem(std::size_t workerThreadCount)
 : mMotd("Sculk Protocol Library"),
   mPeer(RakNet::RakPeerInterface::GetInstance()),
   mOwnedThreadPool(std::make_unique<thread::ThreadPool>(workerThreadCount)),
-  mThreadPool(mOwnedThreadPool.get()) {}
+  mThreadPool(mOwnedThreadPool.get()),
+  mCallbacks(std::make_shared<CallbackSet>()) {}
 
 ServerNetworkSystem::ServerNetworkSystem(thread::ThreadPool& threadPool)
 : mMotd("Sculk Protocol Library"),
   mPeer(RakNet::RakPeerInterface::GetInstance()),
   mOwnedThreadPool(nullptr),
-  mThreadPool(&threadPool) {}
+  mThreadPool(&threadPool),
+  mCallbacks(std::make_shared<CallbackSet>()) {}
 
 ServerNetworkSystem::~ServerNetworkSystem() { stop(); }
 
@@ -76,8 +77,8 @@ ServerNetworkSystem::start(std::uint16_t ipv4Port, std::uint16_t ipv6Port, std::
     mPeer->SetMaximumIncomingConnections(mMaxConnections);
     updateAnnouncement();
 
-    mReceiveThread = std::jthread([this](std::stop_token token) { receiveLoop(token); });
-    mFlushThread   = std::jthread([this](std::stop_token token) { flushLoop(token); });
+    mFlushCursor = 0;
+    scheduleIoPump();
     return NetworkStartResult::Success;
 }
 
@@ -112,8 +113,8 @@ NetworkStartResult ServerNetworkSystem::start(
     mPeer->SetMaximumIncomingConnections(mMaxConnections);
     updateAnnouncement();
 
-    mReceiveThread = std::jthread([this](std::stop_token token) { receiveLoop(token); });
-    mFlushThread   = std::jthread([this](std::stop_token token) { flushLoop(token); });
+    mFlushCursor = 0;
+    scheduleIoPump();
     return NetworkStartResult::Success;
 }
 
@@ -138,8 +139,8 @@ NetworkStartResult ServerNetworkSystem::start(std::uint16_t ipv4Port, std::uint3
     mPeer->SetMaximumIncomingConnections(mMaxConnections);
     updateAnnouncement();
 
-    mReceiveThread = std::jthread([this](std::stop_token token) { receiveLoop(token); });
-    mFlushThread   = std::jthread([this](std::stop_token token) { flushLoop(token); });
+    mFlushCursor = 0;
+    scheduleIoPump();
     return NetworkStartResult::Success;
 }
 
@@ -165,8 +166,8 @@ ServerNetworkSystem::start(const std::string& ipv4Host, std::uint16_t ipv4Port, 
     mPeer->SetMaximumIncomingConnections(mMaxConnections);
     updateAnnouncement();
 
-    mReceiveThread = std::jthread([this](std::stop_token token) { receiveLoop(token); });
-    mFlushThread   = std::jthread([this](std::stop_token token) { flushLoop(token); });
+    mFlushCursor = 0;
+    scheduleIoPump();
     return NetworkStartResult::Success;
 }
 
@@ -206,15 +207,8 @@ void ServerNetworkSystem::stop() {
         return;
     }
 
-    if (mReceiveThread.joinable()) {
-        mReceiveThread.request_stop();
-        mReceiveThread.join();
-    }
-
-    if (mFlushThread.joinable()) {
-        mFlushThread.request_stop();
-        mFlushThread.join();
-    }
+    waitForPendingDelayedWakeups();
+    waitForPendingIoJobs();
 
     std::vector<std::shared_ptr<SessionContext>> contexts;
     contexts.reserve(mSessionContexts.size());
@@ -288,7 +282,11 @@ Result<> ServerNetworkSystem::setOnConnected(ConnectionEventCallback&& callback)
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on connected callback while running");
     }
-    mOnConnected = std::move(callback);
+
+    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    updatedCallbacks->mOnConnected = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
@@ -296,7 +294,11 @@ Result<> ServerNetworkSystem::setOnDisconnected(ConnectionEventCallback&& callba
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on disconnected callback while running");
     }
-    mOnDisconnected = std::move(callback);
+
+    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    updatedCallbacks->mOnDisconnected = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
@@ -304,7 +306,11 @@ Result<> ServerNetworkSystem::setOnPacketReceive(PacketReceiveCallback&& callbac
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on packet receive callback while running");
     }
-    mOnPacketReceive = std::move(callback);
+
+    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    updatedCallbacks->mOnPacketReceive = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
@@ -312,12 +318,16 @@ Result<> ServerNetworkSystem::setOnPacketParseFailed(PacketParseFailedCallback&&
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on packet parse failed callback while running");
     }
-    if (!mOnPacketReceive) {
+    auto callbacks = mCallbacks.load(std::memory_order_acquire);
+    if (!callbacks || !callbacks->mOnPacketReceive) {
         return error_utils::makeError(
             "Cannot set on packet parse failed callback without setting on packet receive callback"
         );
     }
-    mOnPacketParseFailed = std::move(callback);
+
+    auto updatedCallbacks                  = std::make_shared<CallbackSet>(*callbacks);
+    updatedCallbacks->mOnPacketParseFailed = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
@@ -335,97 +345,150 @@ void ServerNetworkSystem::disconnectClient(const RakNet::RakNetGUID& guid) noexc
         context->mSession->disconnect();
     }
 
-    if (mOnDisconnected) {
+    auto callbacks = mCallbacks.load(std::memory_order_acquire);
+    if (callbacks && callbacks->mOnDisconnected) {
         if (context->mStrand) {
-            (void)context->mStrand->enqueue([this, guid]() {
-                mOnDisconnected(guid, RakNet::UNASSIGNED_SYSTEM_ADDRESS);
+            (void)context->mStrand->enqueue([callbacks, guid]() mutable {
+                callbacks->mOnDisconnected(guid, RakNet::UNASSIGNED_SYSTEM_ADDRESS);
             });
         }
     }
 }
 
-void ServerNetworkSystem::receiveLoop(std::stop_token stopToken) {
-    while (!stopToken.stop_requested() && mRunning.load(std::memory_order_acquire)) {
-        const auto tickBegin = std::chrono::steady_clock::now();
+bool ServerNetworkSystem::ioTickOnce() noexcept {
+    bool progressed = false;
 
-        while (detail::RakPacketOwner packet{mPeer.get(), mPeer->Receive()}) {
-            processIncomingPacket(packet.get());
-        }
-
-        const auto nextTick = tickBegin + RECEIVE_TICK_INTERVAL;
-        const auto now      = std::chrono::steady_clock::now();
-        if (now < nextTick) {
-            std::this_thread::sleep_until(nextTick);
-        }
+    while (detail::RakPacketOwner packet{mPeer.get(), mPeer->Receive()}) {
+        processIncomingPacket(*packet.get());
+        progressed = true;
     }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    std::vector<std::shared_ptr<Session>> sessions;
+    sessions.reserve(mSessionContexts.size());
+    mSessionContexts.for_each([&sessions](const SessionContextsMap::value_type& entry) {
+        if (entry.second && entry.second->mSession) {
+            sessions.push_back(entry.second->mSession);
+        }
+    });
+
+    const auto total  = sessions.size();
+    const auto budget = flushBudgetPerTick(total);
+
+    for (std::size_t i = 0; i < budget; ++i) {
+        if (total == 0) {
+            break;
+        }
+
+        const auto index   = (mFlushCursor + i) % total;
+        auto&      session = sessions[index];
+        if (!session || !session->isConnected()) {
+            continue;
+        }
+
+        progressed = session->flushIfDue(now) || progressed;
+    }
+
+    if (total > 0) {
+        mFlushCursor = (mFlushCursor + budget) % total;
+    }
+
+    return progressed;
 }
 
-void ServerNetworkSystem::flushLoop(std::stop_token stopToken) {
-    std::size_t cursor = 0;
-
-    while (!stopToken.stop_requested() && mRunning.load(std::memory_order_acquire)) {
-        const auto tickBegin = std::chrono::steady_clock::now();
-        const auto now       = std::chrono::steady_clock::now();
-
-        std::vector<std::shared_ptr<Session>> sessions;
-        sessions.reserve(mSessionContexts.size());
-        mSessionContexts.for_each([&sessions](const SessionContextsMap::value_type& entry) {
-            if (entry.second && entry.second->mSession) {
-                sessions.push_back(entry.second->mSession);
-            }
-        });
-
-        const auto total  = sessions.size();
-        const auto budget = flushBudgetPerTick(total);
-
-        for (std::size_t i = 0; i < budget; ++i) {
-            if (total == 0) {
-                break;
-            }
-
-            const auto index   = (cursor + i) % total;
-            auto&      session = sessions[index];
-            if (!session || !session->isConnected()) {
-                continue;
-            }
-
-            (void)session->flushIfDue(now);
-        }
-
-        if (total > 0) {
-            cursor = (cursor + budget) % total;
-        }
-
-        const auto nextTick = tickBegin + FLUSH_TICK_INTERVAL;
-        const auto current  = std::chrono::steady_clock::now();
-        if (current < nextTick) {
-            std::this_thread::sleep_until(nextTick);
-        }
-    }
-}
-
-void ServerNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
-    if (!packet || !packet->data || packet->length == 0) {
+void ServerNetworkSystem::scheduleIoPump() noexcept {
+    if (!mRunning.load(std::memory_order_acquire)) {
         return;
     }
 
-    const auto messageId = packet->data[0];
-    const auto key       = packet->guid;
+    bool expected = false;
+    if (!mIoPumpScheduled.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    if (!submitIoJob([this]() noexcept { ioPumpTask(); })) {
+        mIoPumpScheduled.store(false, std::memory_order_release);
+    }
+}
+
+void ServerNetworkSystem::ioPumpTask() noexcept {
+    if (!mRunning.load(std::memory_order_acquire)) {
+        mIoPumpScheduled.store(false, std::memory_order_release);
+        return;
+    }
+
+    const bool progressed = ioTickOnce();
+
+    mIoPumpScheduled.store(false, std::memory_order_release);
+
+    if (!mRunning.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    if (!progressed) {
+        scheduleIoPumpAfter(IO_PUMP_IDLE_WAIT);
+        return;
+    }
+
+    scheduleIoPump();
+}
+
+void ServerNetworkSystem::scheduleIoPumpAfter(std::chrono::milliseconds delay) noexcept {
+    mPendingDelayedWakeups.fetch_add(1, std::memory_order_acq_rel);
+    const bool submitted = mThreadPool->submitAfter(delay, [this]() noexcept {
+        scheduleIoPump();
+        if (mPendingDelayedWakeups.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            mPendingDelayedWakeups.notify_all();
+        }
+    });
+
+    if (!submitted) {
+        if (mPendingDelayedWakeups.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            mPendingDelayedWakeups.notify_all();
+        }
+    }
+}
+
+void ServerNetworkSystem::waitForPendingIoJobs() noexcept {
+    auto pending = mPendingIoJobs.load(std::memory_order_acquire);
+    while (pending != 0) {
+        mPendingIoJobs.wait(pending, std::memory_order_acquire);
+        pending = mPendingIoJobs.load(std::memory_order_acquire);
+    }
+}
+
+void ServerNetworkSystem::waitForPendingDelayedWakeups() noexcept {
+    auto pending = mPendingDelayedWakeups.load(std::memory_order_acquire);
+    while (pending != 0) {
+        mPendingDelayedWakeups.wait(pending, std::memory_order_acquire);
+        pending = mPendingDelayedWakeups.load(std::memory_order_acquire);
+    }
+}
+
+void ServerNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
+    if (!packet.data || packet.length == 0) {
+        return;
+    }
+
+    const auto messageId = packet.data[0];
+    const auto key       = packet.guid;
+    auto       callbacks = mCallbacks.load(std::memory_order_acquire);
 
     if (messageId == DefaultMessageIDTypes::ID_UNCONNECTED_PING) {
         return;
     }
 
     if (messageId == DefaultMessageIDTypes::ID_NEW_INCOMING_CONNECTION) {
-        auto remote       = RakNet::AddressOrGUID{packet};
+        auto remote       = RakNet::AddressOrGUID{&packet};
         auto context      = std::make_shared<SessionContext>();
         context->mSession = std::make_shared<Session>(mPeer.get(), remote);
         context->mStrand  = std::make_shared<thread::TaskStrand>(mThreadPool);
         upsertSessionContext(key, context);
 
-        if (mOnConnected) {
-            (void)context->mStrand->enqueue([this, guid = packet->guid, address = packet->systemAddress]() {
-                mOnConnected(guid, address);
+        if (callbacks && callbacks->mOnConnected) {
+            (void)context->mStrand->enqueue([callbacks, guid = packet.guid, address = packet.systemAddress]() mutable {
+                callbacks->mOnConnected(guid, address);
             });
         }
         return;
@@ -439,19 +502,19 @@ void ServerNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
             context->mSession->disconnect();
         }
 
-        if (mOnDisconnected && context && context->mStrand) {
-            (void)context->mStrand->enqueue([this, guid = packet->guid, address = packet->systemAddress]() {
-                mOnDisconnected(guid, address);
+        if (callbacks && callbacks->mOnDisconnected && context && context->mStrand) {
+            (void)context->mStrand->enqueue([callbacks, guid = packet.guid, address = packet.systemAddress]() mutable {
+                callbacks->mOnDisconnected(guid, address);
             });
         }
         return;
     }
 
-    if (messageId != MINECRAFT_BATCH_PACKET_ID || packet->length <= 1) {
+    if (messageId != MINECRAFT_BATCH_PACKET_ID || packet.length <= 1) {
         return;
     }
 
-    auto context = getSessionContext(packet->guid);
+    auto context = getSessionContext(packet.guid);
     if (!context || !context->mSession || !context->mStrand) {
         return;
     }
@@ -459,8 +522,8 @@ void ServerNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
     auto& session = context->mSession;
     auto& strand  = context->mStrand;
 
-    const auto* payloadBegin = reinterpret_cast<const std::byte*>(packet->data + 1);
-    const auto  payloadSize  = static_cast<std::size_t>(packet->length - 1);
+    const auto* payloadBegin = reinterpret_cast<const std::byte*>(packet.data + 1);
+    const auto  payloadSize  = static_cast<std::size_t>(packet.length - 1);
 
     auto packets = session->deserializeBatchPackets(std::span<const std::byte>{payloadBegin, payloadSize});
     if (!packets) {
@@ -468,23 +531,23 @@ void ServerNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
     }
 
     for (auto& payload : *packets) {
-        if (mOnPacketReceive) {
+        if (callbacks && callbacks->mOnPacketReceive) {
             auto packetExpected = MinecraftPackets::readAndCreatePacketFromBuffer(payload);
             if (packetExpected) {
-                (void)strand->enqueue([this,
-                                       guid    = packet->guid,
-                                       address = packet->systemAddress,
+                (void)strand->enqueue([callbacks,
+                                       guid    = packet.guid,
+                                       address = packet.systemAddress,
                                        packet  = std::move(*packetExpected)]() mutable {
-                    mOnPacketReceive(guid, address, std::move(packet));
+                    callbacks->mOnPacketReceive(guid, address, std::move(packet));
                 });
             } else {
-                if (mOnPacketParseFailed) {
-                    (void)strand->enqueue([this,
-                                           guid         = packet->guid,
-                                           address      = packet->systemAddress,
+                if (callbacks->mOnPacketParseFailed) {
+                    (void)strand->enqueue([callbacks,
+                                           guid         = packet.guid,
+                                           address      = packet.systemAddress,
                                            packet       = std::move(payload),
                                            errorMessage = std::string(packetExpected.error().mMessage)]() mutable {
-                        mOnPacketParseFailed(guid, address, std::move(packet), errorMessage);
+                        callbacks->mOnPacketParseFailed(guid, address, std::move(packet), errorMessage);
                     });
                 }
             }
@@ -505,13 +568,13 @@ void ServerNetworkSystem::upsertSessionContext(const RakNet::RakNetGUID& key, st
 std::shared_ptr<ServerNetworkSystem::SessionContext>
 ServerNetworkSystem::removeSessionContext(const RakNet::RakNetGUID& key) {
     std::shared_ptr<SessionContext> removed;
-    const bool                      found =
-        mSessionContexts.modify_if(key, [&removed](SessionContextsMap::value_type& entry) { removed = entry.second; });
-    if (!found) {
+    const bool erased = mSessionContexts.erase_if(key, [&removed](SessionContextsMap::value_type& entry) {
+        removed = std::move(entry.second);
+        return true;
+    });
+    if (!erased) {
         return nullptr;
     }
-
-    (void)mSessionContexts.erase(key);
     return removed;
 }
 

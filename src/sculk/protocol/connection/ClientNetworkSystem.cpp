@@ -8,18 +8,16 @@
 #include "sculk/protocol/connection/ClientNetworkSystem.hpp"
 #include "sculk/protocol/codec/MinecraftPackets.hpp"
 #include "sculk/protocol/connection/detail/RakPacketOwner.hpp"
-#include "sculk/protocol/connection/io/ClientIoRuntime.hpp"
 #include <MessageIdentifiers.h>
 #include <chrono>
-#include <thread>
+#include <functional>
 
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 namespace {
 
 constexpr std::uint8_t MINECRAFT_BATCH_PACKET_ID = 0xFE;
-constexpr auto         RECEIVE_TICK_INTERVAL     = std::chrono::milliseconds(1);
-constexpr auto         FLUSH_TICK_INTERVAL       = std::chrono::milliseconds(1);
+constexpr auto         IO_PUMP_IDLE_WAIT         = std::chrono::milliseconds(1);
 
 } // namespace
 
@@ -28,27 +26,16 @@ ClientNetworkSystem::ClientNetworkSystem(std::size_t workerThreadCount)
   mOwnedThreadPool(std::make_unique<thread::ThreadPool>(workerThreadCount)),
   mThreadPool(mOwnedThreadPool.get()),
   mCallbackStrand(mThreadPool),
-  mIoRuntime(nullptr),
-  mIoRegistered(false),
-  mSession(std::shared_ptr<Session>{}) {}
+  mSession(std::shared_ptr<Session>{}),
+  mCallbacks(std::make_shared<CallbackSet>()) {}
 
 ClientNetworkSystem::ClientNetworkSystem(thread::ThreadPool& threadPool)
 : mPeer(RakNet::RakPeerInterface::GetInstance()),
   mOwnedThreadPool(nullptr),
   mThreadPool(&threadPool),
   mCallbackStrand(mThreadPool),
-  mIoRuntime(nullptr),
-  mIoRegistered(false),
-  mSession(std::shared_ptr<Session>{}) {}
-
-ClientNetworkSystem::ClientNetworkSystem(thread::ThreadPool& threadPool, io::ClientIoRuntime& ioRuntime)
-: mPeer(RakNet::RakPeerInterface::GetInstance()),
-  mOwnedThreadPool(nullptr),
-  mThreadPool(&threadPool),
-  mCallbackStrand(mThreadPool),
-  mIoRuntime(&ioRuntime),
-  mIoRegistered(false),
-  mSession(std::shared_ptr<Session>{}) {}
+  mSession(std::shared_ptr<Session>{}),
+  mCallbacks(std::make_shared<CallbackSet>()) {}
 
 ClientNetworkSystem::~ClientNetworkSystem() { stop(); }
 
@@ -67,11 +54,6 @@ NetworkStartResult ClientNetworkSystem::start() {
         return static_cast<NetworkStartResult>(startupResult);
     }
 
-    if (mIoRuntime && !mIoRegistered) {
-        mIoRuntime->registerClient(*this);
-        mIoRegistered = true;
-    }
-
     return NetworkStartResult::Success;
 }
 
@@ -80,23 +62,10 @@ void ClientNetworkSystem::stop() {
         return;
     }
 
-    if (mReceiveThread.joinable()) {
-        mReceiveThread.request_stop();
-        mReceiveThread.join();
-    }
+    mIoPumpActive.store(false, std::memory_order_release);
+    waitForPendingDelayedWakeups();
+    waitForPendingIoJobs();
 
-    if (mFlushThread.joinable()) {
-        mFlushThread.request_stop();
-        mFlushThread.join();
-    }
-
-    if (mIoRuntime && mIoRegistered) {
-        mIoRuntime->unregisterClient(*this);
-        mIoRegistered = false;
-    }
-
-    // Keep the session object alive so delayed callbacks that call getSession()
-    // do not dereference a null pointer after disconnect.
     auto session = mSession.load(std::memory_order_acquire);
     if (session) {
         session->disconnect();
@@ -122,34 +91,17 @@ ClientNetworkSystem::ConnectionResult ClientNetworkSystem::connect(std::string_v
         return static_cast<ConnectionResult>(connectResult);
     }
 
-    if (!mIoRuntime) {
-        if (!mReceiveThread.joinable()) {
-            mReceiveThread = std::jthread([this](std::stop_token token) { receiveLoop(token); });
-        }
-
-        if (!mFlushThread.joinable()) {
-            mFlushThread = std::jthread([this](std::stop_token token) { flushLoop(token); });
-        }
-    } else if (mIoRegistered) {
-        mIoRuntime->notifyWork();
-    }
+    mIoPumpActive.store(true, std::memory_order_release);
+    scheduleIoPump();
 
     return ConnectionResult::ConnectionAttemptStarted;
 }
 
 void ClientNetworkSystem::disconnect() {
-    if (mReceiveThread.joinable()) {
-        mReceiveThread.request_stop();
-        mReceiveThread.join();
-    }
+    mIoPumpActive.store(false, std::memory_order_release);
+    waitForPendingDelayedWakeups();
+    waitForPendingIoJobs();
 
-    if (mFlushThread.joinable()) {
-        mFlushThread.request_stop();
-        mFlushThread.join();
-    }
-
-    // Keep the session object alive so delayed callbacks that call getSession()
-    // do not dereference a null pointer after disconnect.
     auto session = mSession.load(std::memory_order_acquire);
     if (session) {
         session->disconnect();
@@ -178,7 +130,11 @@ Result<> ClientNetworkSystem::setOnConnected(ConnectionEventCallback&& callback)
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on connected callback while running");
     }
-    mOnConnected = std::move(callback);
+
+    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    updatedCallbacks->mOnConnected = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
@@ -186,7 +142,11 @@ Result<> ClientNetworkSystem::setOnDisconnected(ConnectionEventCallback&& callba
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on disconnected callback while running");
     }
-    mOnDisconnected = std::move(callback);
+
+    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    updatedCallbacks->mOnDisconnected = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
@@ -194,7 +154,11 @@ Result<> ClientNetworkSystem::setOnConnectionFailed(ConnectionEventCallback&& ca
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on connection failed callback while running");
     }
-    mOnConnectionFailed = std::move(callback);
+
+    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    updatedCallbacks->mOnConnectionFailed = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
@@ -202,7 +166,11 @@ Result<> ClientNetworkSystem::setOnPacketReceive(PacketReceiveCallback&& callbac
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on packet receive callback while running");
     }
-    mOnPacketReceive = std::move(callback);
+
+    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    updatedCallbacks->mOnPacketReceive = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
@@ -210,16 +178,22 @@ Result<> ClientNetworkSystem::setOnPacketParseFailed(PacketParseFailedCallback&&
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on packet parse failed callback while running");
     }
-    if (!mOnPacketReceive) {
+    auto callbacks = mCallbacks.load(std::memory_order_acquire);
+    if (!callbacks || !callbacks->mOnPacketReceive) {
         return error_utils::makeError(
             "Cannot set on packet parse failed callback without setting on packet receive callback"
         );
     }
-    mOnPacketParseFailed = std::move(callback);
+
+    auto updatedCallbacks                  = std::make_shared<CallbackSet>(*callbacks);
+    updatedCallbacks->mOnPacketParseFailed = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
 
-Session& ClientNetworkSystem::getSession() const noexcept { return *mSession.load(std::memory_order_acquire); }
+std::weak_ptr<Session> ClientNetworkSystem::getSession() const noexcept {
+    return mSession.load(std::memory_order_acquire);
+}
 
 bool ClientNetworkSystem::getNetworkStatus(NetworkStatus& outStatus) const noexcept {
     return getServerNetworkStatus(outStatus);
@@ -233,7 +207,7 @@ bool ClientNetworkSystem::ioTickOnce() noexcept {
     bool progressed = false;
 
     while (detail::RakPacketOwner packet{mPeer.get(), mPeer->Receive()}) {
-        processIncomingPacket(packet.get());
+        processIncomingPacket(*packet.get());
         progressed = true;
     }
 
@@ -245,52 +219,89 @@ bool ClientNetworkSystem::ioTickOnce() noexcept {
     return progressed;
 }
 
-void ClientNetworkSystem::receiveLoop(std::stop_token stopToken) {
-    while (!stopToken.stop_requested() && mRunning.load(std::memory_order_acquire)) {
-        const auto tickBegin = std::chrono::steady_clock::now();
-
-        while (detail::RakPacketOwner packet{mPeer.get(), mPeer->Receive()}) {
-            processIncomingPacket(packet.get());
-        }
-
-        const auto nextTick = tickBegin + RECEIVE_TICK_INTERVAL;
-        const auto now      = std::chrono::steady_clock::now();
-        if (now < nextTick) {
-            std::this_thread::sleep_until(nextTick);
-        }
-    }
-}
-
-void ClientNetworkSystem::flushLoop(std::stop_token stopToken) {
-    while (!stopToken.stop_requested() && mRunning.load(std::memory_order_acquire)) {
-        const auto tickBegin = std::chrono::steady_clock::now();
-
-        auto session = mSession.load(std::memory_order_acquire);
-        if (session && session->isConnected()) {
-            (void)session->flushIfDue(std::chrono::steady_clock::now());
-        }
-
-        const auto nextTick = tickBegin + FLUSH_TICK_INTERVAL;
-        const auto now      = std::chrono::steady_clock::now();
-        if (now < nextTick) {
-            std::this_thread::sleep_until(nextTick);
-        }
-    }
-}
-
-void ClientNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
-    if (!packet || !packet->data || packet->length == 0) {
+void ClientNetworkSystem::scheduleIoPump() noexcept {
+    if (!mRunning.load(std::memory_order_acquire) || !mIoPumpActive.load(std::memory_order_acquire)) {
         return;
     }
 
-    const auto messageId = packet->data[0];
+    bool expected = false;
+    if (!mIoPumpScheduled.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    if (!submitIoJob([this]() noexcept { ioPumpTask(); })) {
+        mIoPumpScheduled.store(false, std::memory_order_release);
+    }
+}
+
+void ClientNetworkSystem::ioPumpTask() noexcept {
+    if (!mRunning.load(std::memory_order_acquire) || !mIoPumpActive.load(std::memory_order_acquire)) {
+        mIoPumpScheduled.store(false, std::memory_order_release);
+        return;
+    }
+
+    const bool progressed = ioTickOnce();
+
+    mIoPumpScheduled.store(false, std::memory_order_release);
+
+    if (!mRunning.load(std::memory_order_acquire) || !mIoPumpActive.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    if (!progressed) {
+        scheduleIoPumpAfter(IO_PUMP_IDLE_WAIT);
+        return;
+    }
+
+    scheduleIoPump();
+}
+
+void ClientNetworkSystem::scheduleIoPumpAfter(std::chrono::milliseconds delay) noexcept {
+    mPendingDelayedWakeups.fetch_add(1, std::memory_order_acq_rel);
+    const bool submitted = mThreadPool->submitAfter(delay, [this]() noexcept {
+        scheduleIoPump();
+        if (mPendingDelayedWakeups.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            mPendingDelayedWakeups.notify_all();
+        }
+    });
+
+    if (!submitted) {
+        if (mPendingDelayedWakeups.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            mPendingDelayedWakeups.notify_all();
+        }
+    }
+}
+
+void ClientNetworkSystem::waitForPendingIoJobs() noexcept {
+    auto pending = mPendingIoJobs.load(std::memory_order_acquire);
+    while (pending != 0) {
+        mPendingIoJobs.wait(pending, std::memory_order_acquire);
+        pending = mPendingIoJobs.load(std::memory_order_acquire);
+    }
+}
+
+void ClientNetworkSystem::waitForPendingDelayedWakeups() noexcept {
+    auto pending = mPendingDelayedWakeups.load(std::memory_order_acquire);
+    while (pending != 0) {
+        mPendingDelayedWakeups.wait(pending, std::memory_order_acquire);
+        pending = mPendingDelayedWakeups.load(std::memory_order_acquire);
+    }
+}
+
+void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
+    if (!packet.data || packet.length == 0) {
+        return;
+    }
+
+    const auto messageId = packet.data[0];
+    auto       callbacks = mCallbacks.load(std::memory_order_acquire);
 
     if (messageId == DefaultMessageIDTypes::ID_CONNECTION_REQUEST_ACCEPTED) {
-        auto remote  = RakNet::AddressOrGUID{packet};
+        auto remote  = RakNet::AddressOrGUID{&packet};
         auto session = std::make_shared<Session>(mPeer.get(), remote);
         mSession.store(session, std::memory_order_release);
-        if (mOnConnected) {
-            (void)mCallbackStrand.enqueue([this]() { mOnConnected(); });
+        if (callbacks && callbacks->mOnConnected) {
+            (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnected(); });
         }
         return;
     }
@@ -304,8 +315,8 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
             mSession.store(nullptr, std::memory_order_release);
         }
 
-        if (mOnDisconnected) {
-            (void)mCallbackStrand.enqueue([this]() { mOnDisconnected(); });
+        if (callbacks && callbacks->mOnDisconnected) {
+            (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnDisconnected(); });
         }
         return;
     }
@@ -319,13 +330,13 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
             mSession.store(nullptr, std::memory_order_release);
         }
 
-        if (mOnConnectionFailed) {
-            (void)mCallbackStrand.enqueue([this]() { mOnConnectionFailed(); });
+        if (callbacks && callbacks->mOnConnectionFailed) {
+            (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnectionFailed(); });
         }
         return;
     }
 
-    if (messageId != MINECRAFT_BATCH_PACKET_ID || packet->length <= 1) {
+    if (messageId != MINECRAFT_BATCH_PACKET_ID || packet.length <= 1) {
         return;
     }
 
@@ -334,8 +345,8 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
         return;
     }
 
-    const auto* payloadBegin = reinterpret_cast<const std::byte*>(packet->data + 1);
-    const auto  payloadSize  = static_cast<std::size_t>(packet->length - 1);
+    const auto* payloadBegin = reinterpret_cast<const std::byte*>(packet.data + 1);
+    const auto  payloadSize  = static_cast<std::size_t>(packet.length - 1);
 
     auto packets = session->deserializeBatchPackets(std::span<const std::byte>{payloadBegin, payloadSize});
     if (!packets) {
@@ -343,19 +354,19 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet* packet) {
     }
 
     for (auto& payload : *packets) {
-        if (mOnPacketReceive) {
+        if (callbacks && callbacks->mOnPacketReceive) {
             auto packetExpected = MinecraftPackets::readAndCreatePacketFromBuffer(payload);
             if (packetExpected) {
-                (void)mCallbackStrand.enqueue([this, packet = std::move(*packetExpected)]() mutable {
-                    mOnPacketReceive(std::move(packet));
+                (void)mCallbackStrand.enqueue([callbacks, packet = std::move(*packetExpected)]() mutable {
+                    callbacks->mOnPacketReceive(std::move(packet));
                 });
             } else {
-                if (mOnPacketParseFailed) {
-                    (void)mCallbackStrand.enqueue([this,
+                if (callbacks->mOnPacketParseFailed) {
+                    (void)mCallbackStrand.enqueue([callbacks,
                                                    buffer = std::move(payload),
                                                    errorMessage =
                                                        std::string(packetExpected.error().mMessage)]() mutable {
-                        mOnPacketParseFailed(std::move(buffer), errorMessage);
+                        callbacks->mOnPacketParseFailed(std::move(buffer), errorMessage);
                     });
                 }
             }

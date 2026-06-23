@@ -14,23 +14,19 @@
 #include "thread/AtomicSharedPtr.hpp"
 #include <RakPeerInterface.h>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <type_traits>
+#include <utility>
 
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
-namespace io {
-class ClientIoRuntime;
-}
-
 class ClientNetworkSystem final {
-    friend class io::ClientIoRuntime;
-
 public:
     using ConnectionEventCallback   = std::function<void()>;
     using PacketReceiveCallback     = std::function<void(std::unique_ptr<IPacket>&& packet)>;
@@ -39,7 +35,6 @@ public:
 public:
     explicit ClientNetworkSystem(std::size_t workerThreadCount = 0);
     explicit ClientNetworkSystem(thread::ThreadPool& threadPool);
-    ClientNetworkSystem(thread::ThreadPool& threadPool, io::ClientIoRuntime& ioRuntime);
 
     ClientNetworkSystem(const ClientNetworkSystem&)            = delete;
     ClientNetworkSystem& operator=(const ClientNetworkSystem&) = delete;
@@ -85,7 +80,7 @@ public:
 
     Result<> setOnPacketParseFailed(PacketParseFailedCallback&& callback) noexcept;
 
-    [[nodiscard]] Session& getSession() const noexcept;
+    [[nodiscard]] std::weak_ptr<Session> getSession() const noexcept;
 
     [[nodiscard]] bool getNetworkStatus(NetworkStatus& outStatus) const noexcept;
 
@@ -96,31 +91,62 @@ private:
         void operator()(RakNet::RakPeerInterface* peer) const noexcept;
     };
 
+    struct CallbackSet final {
+        ConnectionEventCallback   mOnConnected{};
+        ConnectionEventCallback   mOnDisconnected{};
+        ConnectionEventCallback   mOnConnectionFailed{};
+        PacketReceiveCallback     mOnPacketReceive{};
+        PacketParseFailedCallback mOnPacketParseFailed{};
+    };
+
 private:
     [[nodiscard]] bool ioTickOnce() noexcept;
 
-    void receiveLoop(std::stop_token stopToken);
+    void scheduleIoPump() noexcept;
 
-    void flushLoop(std::stop_token stopToken);
+    void ioPumpTask() noexcept;
 
-    void processIncomingPacket(RakNet::Packet* packet);
+    void scheduleIoPumpAfter(std::chrono::milliseconds delay) noexcept;
+
+    void waitForPendingIoJobs() noexcept;
+
+    void waitForPendingDelayedWakeups() noexcept;
+
+    template <typename F>
+        requires std::invocable<F&> && std::is_nothrow_invocable_v<F&>
+    bool submitIoJob(F&& job) noexcept {
+        mPendingIoJobs.fetch_add(1, std::memory_order_acq_rel);
+
+        const bool submitted = mThreadPool->submit([this, job = std::forward<F>(job)]() mutable noexcept {
+            job();
+            if (mPendingIoJobs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                mPendingIoJobs.notify_all();
+            }
+        });
+
+        if (!submitted) {
+            if (mPendingIoJobs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                mPendingIoJobs.notify_all();
+            }
+        }
+
+        return submitted;
+    }
+
+    void processIncomingPacket(RakNet::Packet& packet);
 
 private:
     std::unique_ptr<RakNet::RakPeerInterface, RakPeerDeleter> mPeer{};
     std::unique_ptr<thread::ThreadPool>                       mOwnedThreadPool{};
     thread::ThreadPool*                                       mThreadPool{};
     thread::TaskStrand                                        mCallbackStrand{};
-    io::ClientIoRuntime*                                      mIoRuntime{};
-    bool                                                      mIoRegistered{false};
     std::atomic_bool                                          mRunning{false};
-    std::jthread                                              mReceiveThread{};
-    std::jthread                                              mFlushThread{};
+    std::atomic_bool                                          mIoPumpActive{false};
+    std::atomic_bool                                          mIoPumpScheduled{false};
+    std::atomic_uint32_t                                      mPendingIoJobs{0};
+    std::atomic_uint32_t                                      mPendingDelayedWakeups{0};
     AtomicSharedPtr<Session>                                  mSession{};
-    ConnectionEventCallback                                   mOnConnected{};
-    ConnectionEventCallback                                   mOnDisconnected{};
-    ConnectionEventCallback                                   mOnConnectionFailed{};
-    PacketReceiveCallback                                     mOnPacketReceive{};
-    PacketParseFailedCallback                                 mOnPacketParseFailed{};
+    AtomicSharedPtr<CallbackSet>                              mCallbacks{};
 };
 
 } // namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE

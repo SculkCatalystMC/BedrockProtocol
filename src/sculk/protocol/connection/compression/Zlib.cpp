@@ -13,6 +13,7 @@
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE::compression::zlib {
 
 #define ZLIB_STREAM_CHUNK 65536
+constexpr std::size_t ZLIB_MAX_DECOMPRESSED_SIZE = 64ull * 1024ull * 1024ull;
 
 std::vector<std::byte> compress(std::span<const std::byte> input) {
     z_stream strm;
@@ -62,6 +63,10 @@ Result<std::vector<std::byte>> decompress(std::span<const std::byte> input) {
         ret            = inflate(&zstr, Z_NO_FLUSH);
         if (ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) break;
         size_t have = ZLIB_STREAM_CHUNK - zstr.avail_out;
+        if (output.size() + have > ZLIB_MAX_DECOMPRESSED_SIZE) {
+            ret = Z_MEM_ERROR;
+            break;
+        }
         output.insert(
             output.end(),
             reinterpret_cast<std::byte*>(out_buffer),

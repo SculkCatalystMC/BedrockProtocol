@@ -8,7 +8,6 @@
 #pragma once
 #include "sculk/protocol/codec/level/CompressionAlgorithm.hpp"
 #include "sculk/protocol/connection/NetworkStatus.hpp"
-#include "sculk/protocol/connection/coro/Task.hpp"
 #include "sculk/protocol/connection/encryption/CryptoManager.hpp"
 #include "sculk/protocol/utility/Enum.hpp"
 #include "sculk/protocol/utility/Result.hpp"
@@ -91,8 +90,6 @@ public:
 
     [[nodiscard]] bool receivePacket(Buffer& outBuffer) noexcept;
 
-    [[nodiscard]] coro::Task<Result<Buffer>> receivePacketAsync();
-
     void disconnect() noexcept;
 
     [[nodiscard]] bool isConnected() const noexcept;
@@ -123,7 +120,9 @@ public:
     [[nodiscard]] Result<BatchedBuffer> deserializeBatchPackets(std::span<const std::byte> batchedBuffer);
 
 private:
-    [[nodiscard]] bool flushUnlocked();
+    [[nodiscard]] bool flushPendingBeforeStateChangeUnlocked() noexcept;
+
+    [[nodiscard]] bool dequeueOutboundUnlocked(OutboundBuffers& outPackets) noexcept;
 };
 
 } // namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE
