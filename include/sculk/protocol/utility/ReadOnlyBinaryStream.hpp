@@ -34,6 +34,11 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 #endif
 
 class ReadOnlyBinaryStream {
+    static_assert(
+        std::endian::native == std::endian::little,
+        "ReadOnlyBinaryStream requires little-endian architecture"
+    );
+
 public:
     bool                       mHasOverflowed{};
     std::span<const std::byte> mBufferView{};

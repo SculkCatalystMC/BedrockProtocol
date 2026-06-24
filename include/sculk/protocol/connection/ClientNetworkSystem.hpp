@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -28,9 +29,11 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 class ClientNetworkSystem final {
 public:
-    using ConnectionEventCallback   = std::function<void()>;
-    using PacketReceiveCallback     = std::function<void(std::unique_ptr<IPacket>&& packet)>;
-    using PacketParseFailedCallback = std::function<void(Session::Buffer&& buffer, std::string errorMessage)>;
+    using ConnectionEventCallback      = std::function<void()>;
+    using RawPacketReceiveCallback     = std::function<bool(Session::Buffer& payload)>;
+    using PacketReceiveCallback        = std::function<void(std::unique_ptr<IPacket>&& packet)>;
+    using PacketParseFailedCallback    = std::function<void(MinecraftPacketIds id, std::string_view message)>;
+    using TaskStrandBackpressurePolicy = thread::TaskStrand::BackpressurePolicy;
 
 public:
     explicit ClientNetworkSystem(std::size_t workerThreadCount = 0);
@@ -56,35 +59,54 @@ public:
     };
 
 public:
+    // Starts the client network system and initializes the RakNet peer.
     [[nodiscard]] NetworkStartResult start();
 
+    // Stops the client network system and releases all pending work.
     void stop();
 
+    // Initiates a connection attempt to the specified host and port.
     [[nodiscard]] ConnectionResult connect(std::string_view host, std::uint16_t port);
 
+    // Disconnects the current session if one is active.
     void disconnect();
 
+    // Returns whether the client network system is currently running.
     [[nodiscard]] bool isRunning() const noexcept;
 
+    // Returns whether the client currently has an active session.
     [[nodiscard]] bool isConnected() const noexcept;
 
+    // Copies the current server network status into the output parameter.
     [[nodiscard]] bool getServerNetworkStatus(NetworkStatus& outStatus) const noexcept;
 
+    // Sets the callback invoked when the connection is established.
     Result<> setOnConnected(ConnectionEventCallback&& callback) noexcept;
 
+    // Sets the callback invoked when the connection is closed.
     Result<> setOnDisconnected(ConnectionEventCallback&& callback) noexcept;
 
+    // Sets the callback invoked when a connection attempt fails.
     Result<> setOnConnectionFailed(ConnectionEventCallback&& callback) noexcept;
 
+    // Sets the callback invoked when a packet is received.
     Result<> setOnPacketReceive(PacketReceiveCallback&& callback) noexcept;
 
+    // Sets the callback invoked when packet parsing fails.
     Result<> setOnPacketParseFailed(PacketParseFailedCallback&& callback) noexcept;
 
+    // Sets the callback invoked when a raw packet is received. If this callback returns false, the packet will not be
+    // processed further.
+    Result<> setOnRawPacketReceive(RawPacketReceiveCallback&& callback) noexcept;
+
+    // Sets the backpressure policy used by the callback strand.
+    Result<> setOnTaskPressure(TaskStrandBackpressurePolicy&& callback) noexcept;
+
+    // Returns a weak reference to the current session, if any.
     [[nodiscard]] std::weak_ptr<Session> getSession() const noexcept;
 
+    // Copies the current network status into the output parameter.
     [[nodiscard]] bool getNetworkStatus(NetworkStatus& outStatus) const noexcept;
-
-    [[nodiscard]] std::uint64_t getDroppedEventCallbackCount() const noexcept;
 
 private:
     struct RakPeerDeleter {
@@ -97,6 +119,7 @@ private:
         ConnectionEventCallback   mOnConnectionFailed{};
         PacketReceiveCallback     mOnPacketReceive{};
         PacketParseFailedCallback mOnPacketParseFailed{};
+        RawPacketReceiveCallback  mOnRawPacketReceive{};
     };
 
 private:

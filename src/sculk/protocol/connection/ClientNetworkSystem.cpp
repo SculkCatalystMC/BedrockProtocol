@@ -17,7 +17,7 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 namespace {
 
 constexpr std::uint8_t MINECRAFT_BATCH_PACKET_ID = 0xFE;
-constexpr auto         IO_PUMP_IDLE_WAIT         = std::chrono::milliseconds(1);
+constexpr auto         IO_PUMP_IDLE_WAIT         = std::chrono::milliseconds(20);
 
 } // namespace
 
@@ -131,8 +131,8 @@ Result<> ClientNetworkSystem::setOnConnected(ConnectionEventCallback&& callback)
         return error_utils::makeError("Cannot set on connected callback while running");
     }
 
-    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
-    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    auto callbacks                 = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks          = std::make_shared<CallbackSet>(*callbacks);
     updatedCallbacks->mOnConnected = std::move(callback);
     mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
@@ -143,8 +143,8 @@ Result<> ClientNetworkSystem::setOnDisconnected(ConnectionEventCallback&& callba
         return error_utils::makeError("Cannot set on disconnected callback while running");
     }
 
-    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
-    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    auto callbacks                    = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks             = std::make_shared<CallbackSet>(*callbacks);
     updatedCallbacks->mOnDisconnected = std::move(callback);
     mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
@@ -155,8 +155,8 @@ Result<> ClientNetworkSystem::setOnConnectionFailed(ConnectionEventCallback&& ca
         return error_utils::makeError("Cannot set on connection failed callback while running");
     }
 
-    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
-    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    auto callbacks                        = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks                 = std::make_shared<CallbackSet>(*callbacks);
     updatedCallbacks->mOnConnectionFailed = std::move(callback);
     mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
@@ -167,9 +167,27 @@ Result<> ClientNetworkSystem::setOnPacketReceive(PacketReceiveCallback&& callbac
         return error_utils::makeError("Cannot set on packet receive callback while running");
     }
 
-    auto callbacks        = mCallbacks.load(std::memory_order_acquire);
-    auto updatedCallbacks = callbacks ? std::make_shared<CallbackSet>(*callbacks) : std::make_shared<CallbackSet>();
+    auto callbacks                     = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks              = std::make_shared<CallbackSet>(*callbacks);
     updatedCallbacks->mOnPacketReceive = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
+    return {};
+}
+
+Result<> ClientNetworkSystem::setOnRawPacketReceive(RawPacketReceiveCallback&& callback) noexcept {
+    if (mRunning.load(std::memory_order_acquire)) {
+        return error_utils::makeError("Cannot set on raw packet receive callback while running");
+    }
+
+    auto callbacks = mCallbacks.load(std::memory_order_acquire);
+    if (!callbacks->mOnPacketReceive) {
+        return error_utils::makeError(
+            "Cannot set on raw packet receive callback without setting on packet receive callback"
+        );
+    }
+
+    auto updatedCallbacks                 = std::make_shared<CallbackSet>(*callbacks);
+    updatedCallbacks->mOnRawPacketReceive = std::move(callback);
     mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
     return {};
 }
@@ -179,7 +197,7 @@ Result<> ClientNetworkSystem::setOnPacketParseFailed(PacketParseFailedCallback&&
         return error_utils::makeError("Cannot set on packet parse failed callback while running");
     }
     auto callbacks = mCallbacks.load(std::memory_order_acquire);
-    if (!callbacks || !callbacks->mOnPacketReceive) {
+    if (!callbacks->mOnPacketReceive) {
         return error_utils::makeError(
             "Cannot set on packet parse failed callback without setting on packet receive callback"
         );
@@ -191,16 +209,21 @@ Result<> ClientNetworkSystem::setOnPacketParseFailed(PacketParseFailedCallback&&
     return {};
 }
 
+Result<> ClientNetworkSystem::setOnTaskPressure(TaskStrandBackpressurePolicy&& callback) noexcept {
+    if (mRunning.load(std::memory_order_acquire)) {
+        return error_utils::makeError("Cannot set backpressure policy while running");
+    }
+
+    mCallbackStrand.setBackpressurePolicy(std::move(callback));
+    return {};
+}
+
 std::weak_ptr<Session> ClientNetworkSystem::getSession() const noexcept {
     return mSession.load(std::memory_order_acquire);
 }
 
 bool ClientNetworkSystem::getNetworkStatus(NetworkStatus& outStatus) const noexcept {
     return getServerNetworkStatus(outStatus);
-}
-
-std::uint64_t ClientNetworkSystem::getDroppedEventCallbackCount() const noexcept {
-    return mCallbackStrand.droppedCount();
 }
 
 bool ClientNetworkSystem::ioTickOnce() noexcept {
@@ -300,7 +323,7 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
         auto remote  = RakNet::AddressOrGUID{&packet};
         auto session = std::make_shared<Session>(mPeer.get(), remote);
         mSession.store(session, std::memory_order_release);
-        if (callbacks && callbacks->mOnConnected) {
+        if (callbacks->mOnConnected) {
             (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnected(); });
         }
         return;
@@ -315,7 +338,7 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
             mSession.store(nullptr, std::memory_order_release);
         }
 
-        if (callbacks && callbacks->mOnDisconnected) {
+        if (callbacks->mOnDisconnected) {
             (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnDisconnected(); });
         }
         return;
@@ -330,7 +353,7 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
             mSession.store(nullptr, std::memory_order_release);
         }
 
-        if (callbacks && callbacks->mOnConnectionFailed) {
+        if (callbacks->mOnConnectionFailed) {
             (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnectionFailed(); });
         }
         return;
@@ -354,21 +377,29 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
     }
 
     for (auto& payload : *packets) {
-        if (callbacks && callbacks->mOnPacketReceive) {
-            auto packetExpected = MinecraftPackets::readAndCreatePacketFromBuffer(payload);
-            if (packetExpected) {
-                (void)mCallbackStrand.enqueue([callbacks, packet = std::move(*packetExpected)]() mutable {
-                    callbacks->mOnPacketReceive(std::move(packet));
-                });
-            } else {
+        if (callbacks->mOnPacketReceive) {
+            if (callbacks->mOnRawPacketReceive && !callbacks->mOnRawPacketReceive(payload)) {
+                continue;
+            }
+
+            ReadOnlyBinaryStream stream{payload};
+
+            auto header = MinecraftPackets::readPacketHeader(stream);
+            if (!header) {
                 if (callbacks->mOnPacketParseFailed) {
-                    (void)mCallbackStrand.enqueue([callbacks,
-                                                   buffer = std::move(payload),
-                                                   errorMessage =
-                                                       std::string(packetExpected.error().mMessage)]() mutable {
-                        callbacks->mOnPacketParseFailed(std::move(buffer), errorMessage);
-                    });
+                    callbacks->mOnPacketParseFailed(
+                        static_cast<MinecraftPacketIds>(-1), // -1 as invalid packet ID
+                        "Failed to read packet header"
+                    );
                 }
+                continue;
+            }
+
+            auto packetExpected = MinecraftPackets::readAndCreatePacketFromHeader(*header, stream);
+            if (packetExpected) {
+                callbacks->mOnPacketReceive(std::move(*packetExpected));
+            } else if (callbacks->mOnPacketParseFailed) {
+                callbacks->mOnPacketParseFailed(header->mPacketId, packetExpected.error().mMessage);
             }
         } else {
             (void)session->enqueueInboundPacket(std::move(payload));

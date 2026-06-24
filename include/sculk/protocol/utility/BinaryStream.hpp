@@ -25,6 +25,8 @@
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 class BinaryStream {
+    static_assert(std::endian::native == std::endian::little, "BinaryStream requires little-endian architecture");
+
 public:
     std::vector<std::byte>& mBuffer;
 

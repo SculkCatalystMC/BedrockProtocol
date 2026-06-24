@@ -329,6 +329,32 @@ Result<std::unique_ptr<IPacket>> MinecraftPackets::readAndCreatePacketFromBuffer
     return packet;
 }
 
+Result<std::unique_ptr<IPacket>>
+MinecraftPackets::readAndCreatePacketFromHeader(const PacketHeader& header, ReadOnlyBinaryStream& stream) {
+    auto packet = createPacket(header);
+    if (!packet) {
+        return packet;
+    }
+    if (auto status = (*packet)->read(stream); !status) {
+        return MAKE_ERROR("Failed to read packet from stream", status);
+    }
+    if (stream.hasDataLeft()) {
+        return error_utils::makeError("Extra data left in buffer after reading packet");
+    }
+    return packet;
+}
+
+Result<> MinecraftPackets::readPacket(IPacket& packet, ReadOnlyBinaryStream& stream) {
+    auto readResult = packet.read(stream);
+    if (!readResult) {
+        return readResult;
+    }
+    if (stream.hasDataLeft()) {
+        return error_utils::makeError("Extra data left in buffer after reading packet");
+    }
+    return {};
+}
+
 Result<std::unique_ptr<IPacket>> MinecraftPackets::createPacket(MinecraftPacketIds packetId) {
     CREATE_PACKET_SWITCH(packetId)
     CREATE_PACKET(Login)                                  // 1

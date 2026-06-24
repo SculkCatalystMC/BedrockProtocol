@@ -33,9 +33,14 @@ public:
     [[nodiscard]] static Result<std::unique_ptr<IPacket>>
     readAndCreatePacketFromBuffer(std::span<const std::byte> buffer);
 
+    [[nodiscard]] static Result<std::unique_ptr<IPacket>>
+    readAndCreatePacketFromHeader(const PacketHeader& header, ReadOnlyBinaryStream& stream);
+
     [[nodiscard]] static Result<PacketHeader> readPacketHeader(ReadOnlyBinaryStream& stream);
 
     static void writePacketHeader(BinaryStream& stream, const PacketHeader& header);
+
+    [[nodiscard]] static Result<> readPacket(IPacket& packet, ReadOnlyBinaryStream& stream);
 };
 
 } // namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE

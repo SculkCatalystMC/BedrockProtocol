@@ -8,9 +8,11 @@
 #pragma once
 
 #include "sculk/protocol/Version.hpp"
+#include "sculk/protocol/connection/thread/AtomicSharedPtr.hpp"
 #include "sculk/protocol/connection/thread/ThreadPool.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <concepts>
 #include <concurrentqueue.h>
 #include <cstdint>
@@ -23,6 +25,9 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE::thread {
 
 class TaskStrand final {
 public:
+    using BackpressurePolicy =
+        std::function<std::chrono::steady_clock::duration(std::uint32_t pendingTasks, std::uint32_t maxPendingTasks)>;
+
 #ifndef _LIBCPP_VERSION
     using Task = std::move_only_function<void()>;
 #else
@@ -79,6 +84,15 @@ public:
         mState->mMaxPendingTasks.store(maxPendingTasks, std::memory_order_release);
     }
 
+    // Sets a policy that decides how long to wait when the strand is overloaded.
+    void setBackpressurePolicy(BackpressurePolicy policy) noexcept {
+        if (policy) {
+            mState->mBackpressurePolicy.store(std::make_shared<BackpressurePolicy>(std::move(policy)));
+        } else {
+            mState->mBackpressurePolicy.store(nullptr);
+        }
+    }
+
     [[nodiscard]] std::uint32_t maxPendingTasks() const noexcept {
         return mState->mMaxPendingTasks.load(std::memory_order_acquire);
     }
@@ -92,32 +106,31 @@ public:
             return false;
         }
 
-        const auto pending = state->mPendingTasks.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (pending > state->mMaxPendingTasks.load(std::memory_order_acquire)) {
-            state->mPendingTasks.fetch_sub(1, std::memory_order_acq_rel);
-            state->mDroppedCount.fetch_add(1, std::memory_order_relaxed);
-            return false;
+        const auto pending    = state->mPendingTasks.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const auto maxPending = state->mMaxPendingTasks.load(std::memory_order_acquire);
+        if (pending > maxPending) {
+            auto backpressurePolicy = state->mBackpressurePolicy.load(std::memory_order_acquire);
+            if (backpressurePolicy) {
+                const auto delay = (*backpressurePolicy)(pending, maxPending);
+                if (delay > std::chrono::steady_clock::duration::zero()) {
+                    std::this_thread::sleep_for(delay);
+                }
+            }
         }
 
         auto* pool = state->mThreadPool;
         if (!pool) {
             state->mPendingTasks.fetch_sub(1, std::memory_order_acq_rel);
-            state->mDroppedCount.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
         if (!state->mTasks.enqueue(std::move(wrapped))) {
             state->mPendingTasks.fetch_sub(1, std::memory_order_acq_rel);
-            state->mDroppedCount.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
         scheduleDrain(std::move(state), *pool);
         return true;
-    }
-
-    [[nodiscard]] std::uint64_t droppedCount() const noexcept {
-        return mState->mDroppedCount.load(std::memory_order_relaxed);
     }
 
     [[nodiscard]] std::uint32_t pendingTasks() const noexcept {
@@ -130,12 +143,12 @@ private:
         : mThreadPool(threadPool),
           mMaxPendingTasks(maxPendingTasks) {}
 
-        ThreadPool*                       mThreadPool{nullptr};
-        moodycamel::ConcurrentQueue<Task> mTasks{};
-        std::atomic_uint32_t              mMaxPendingTasks{DEFAULT_MAX_PENDING_TASKS};
-        std::atomic_uint32_t              mPendingTasks{0};
-        std::atomic_bool                  mDrainScheduled{false};
-        std::atomic<std::uint64_t>        mDroppedCount{0};
+        ThreadPool*                         mThreadPool{nullptr};
+        moodycamel::ConcurrentQueue<Task>   mTasks{};
+        std::atomic_uint32_t                mMaxPendingTasks{DEFAULT_MAX_PENDING_TASKS};
+        std::atomic_uint32_t                mPendingTasks{0};
+        std::atomic_bool                    mDrainScheduled{false};
+        AtomicSharedPtr<BackpressurePolicy> mBackpressurePolicy{};
     };
 
     void scheduleDrain(std::shared_ptr<State> state, ThreadPool& pool) noexcept {
@@ -146,7 +159,6 @@ private:
         const bool submitted = pool.submit([state]() noexcept { drain(std::move(state)); });
         if (!submitted) {
             state->mDrainScheduled.store(false, std::memory_order_release);
-            state->mDroppedCount.fetch_add(1, std::memory_order_relaxed);
             drain(std::move(state));
         }
     }

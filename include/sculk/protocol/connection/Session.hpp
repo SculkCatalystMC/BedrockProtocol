@@ -33,6 +33,10 @@ public:
     using BatchedBuffer   = std::vector<Buffer>;
     using OutboundBuffers = std::vector<Buffer>;
 
+    explicit Session(RakNet::RakPeerInterface* peer, const RakNet::AddressOrGUID& remote) noexcept;
+
+    ~Session();
+
 protected:
     RakNet::RakPeerInterface*             mPeer{};
     RakNet::AddressOrGUID                 mRemote{};
@@ -40,10 +44,6 @@ protected:
     std::deque<Buffer>                    mOutboundPackets{};
     std::atomic_uint32_t                  mInboundQueuedPackets{0};
     std::atomic_uint32_t                  mOutboundQueuedPackets{0};
-    std::atomic_uint64_t                  mInboundQueuedBytes{0};
-    std::atomic_uint64_t                  mOutboundQueuedBytes{0};
-    std::atomic_uint64_t                  mDroppedInboundPackets{0};
-    std::atomic_uint64_t                  mDroppedOutboundPackets{0};
     std::atomic_bool                      mConnected{};
     std::optional<CompressionAlgorithm>   mCompressionType{};
     std::int32_t                          mCompressionThreshold{};
@@ -51,21 +51,10 @@ protected:
     std::chrono::steady_clock::time_point mNextFlushAt{};
     mutable std::mutex                    mMutex{};
 
-public:
-    static constexpr std::uint32_t MAX_INBOUND_QUEUED_PACKETS  = 4096;
-    static constexpr std::uint32_t MAX_OUTBOUND_QUEUED_PACKETS = 4096;
-    static constexpr std::uint64_t MAX_INBOUND_QUEUED_BYTES    = 8ULL * 1024ULL * 1024ULL;
-    static constexpr std::uint64_t MAX_OUTBOUND_QUEUED_BYTES   = 8ULL * 1024ULL * 1024ULL;
-
-public:
-    explicit Session(RakNet::RakPeerInterface* peer, const RakNet::AddressOrGUID& remote) noexcept;
-
     Session(const Session&)            = delete;
     Session& operator=(const Session&) = delete;
     Session(Session&&)                 = delete;
     Session& operator=(Session&&)      = delete;
-
-    ~Session();
 
 public:
     [[nodiscard]] bool isCompressed() const noexcept;
@@ -108,10 +97,6 @@ public:
     [[nodiscard]] bool hasPendingInboundPackets() const noexcept;
 
     [[nodiscard]] bool hasPendingOutboundPackets() const noexcept;
-
-    [[nodiscard]] std::uint64_t droppedInboundPackets() const noexcept;
-
-    [[nodiscard]] std::uint64_t droppedOutboundPackets() const noexcept;
 
     [[nodiscard]] bool enqueueInboundPacket(Buffer&& buffer) noexcept;
 
