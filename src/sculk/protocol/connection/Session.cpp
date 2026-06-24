@@ -69,12 +69,13 @@ void Session::setEncrypted(std::vector<std::byte>&& key) noexcept {
 }
 
 bool Session::sendPacket(BufferView buffer) {
-    Buffer           copied{buffer.begin(), buffer.end()};
     std::scoped_lock lock{mMutex};
 
     if (!mConnected.load(std::memory_order_relaxed)) {
         return false;
     }
+
+    Buffer copied{buffer.begin(), buffer.end()};
 
     mOutboundPackets.push_back(std::move(copied));
 
@@ -124,26 +125,18 @@ bool Session::flush() {
         }
     }
 
-    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
-        return false;
-    }
-
     Buffer       packetsBuffer{};
     BinaryStream packetStream{packetsBuffer};
 
-    for (const auto& buf : outPackets) {
-        packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(buf.size()));
-        packetStream.writeBytes(buf.data(), buf.size());
+    for (const auto& packet : outPackets) {
+        packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(packet.size()));
+        packetStream.writeBytes(packet.data(), packet.size());
     }
 
     return sendBatchedBufferImmediately(std::move(packetsBuffer));
 }
 
 bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
-    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
-        return false;
-    }
-
     OutboundBuffers outPackets{};
 
     {
@@ -159,16 +152,12 @@ bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
         }
     }
 
-    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
-        return false;
-    }
-
     Buffer       packetsBuffer{};
     BinaryStream packetStream{packetsBuffer};
 
-    for (const auto& buf : outPackets) {
-        packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(buf.size()));
-        packetStream.writeBytes(buf.data(), buf.size());
+    for (const auto& packet : outPackets) {
+        packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(packet.size()));
+        packetStream.writeBytes(packet.data(), packet.size());
     }
 
     return sendBatchedBufferImmediately(std::move(packetsBuffer));
@@ -183,9 +172,8 @@ bool Session::dequeueOutboundUnlocked(OutboundBuffers& outPackets) noexcept {
     outPackets.reserve(mOutboundPackets.size());
 
     while (!mOutboundPackets.empty()) {
-        Buffer packet = std::move(mOutboundPackets.front());
+        outPackets.push_back(std::move(mOutboundPackets.front()));
         mOutboundPackets.pop_front();
-        outPackets.push_back(std::move(packet));
     }
 
     return !outPackets.empty();
@@ -200,9 +188,9 @@ bool Session::flushPendingBeforeStateChangeUnlocked() noexcept {
     Buffer       packetsBuffer{};
     BinaryStream packetStream{packetsBuffer};
 
-    for (const auto& buf : outPackets) {
-        packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(buf.size()));
-        packetStream.writeBytes(buf.data(), buf.size());
+    for (const auto& packet : outPackets) {
+        packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(packet.size()));
+        packetStream.writeBytes(packet.data(), packet.size());
     }
 
     return sendBatchedBufferImmediately(std::move(packetsBuffer));
@@ -219,6 +207,10 @@ bool Session::receivePacket(Buffer& outBuffer) noexcept {
 }
 
 bool Session::sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept {
+    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
+        return false;
+    }
+
     Buffer       finalBuffer{};
     BinaryStream compressedStream{finalBuffer};
 

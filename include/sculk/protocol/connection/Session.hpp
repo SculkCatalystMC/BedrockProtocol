@@ -57,10 +57,12 @@ protected:
 public:
     [[nodiscard]] bool isCompressed() const noexcept;
 
+    // NOT THREAD SAFE
     void setCompressed(CompressionAlgorithm type, std::int32_t threshold) noexcept;
 
     [[nodiscard]] bool isEncrypted() const noexcept;
 
+    // NOT THREAD SAFE
     void setEncrypted(std::vector<std::byte>&& key) noexcept;
 
     bool sendPacket(Buffer&& buffer);

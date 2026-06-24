@@ -61,21 +61,24 @@ void ThreadPool::workerLoop(std::stop_token stopToken, std::size_t workerIndex) 
         }
 
         for (;;) {
-            std::shared_ptr<Task> delayedTask{};
+            Task delayedTask{};
+            bool hasDelayedTask = false;
             {
                 std::lock_guard lock{state.mDelayedMutex};
                 if (!state.mDelayedTasks.empty()
-                    && state.mDelayedTasks.top().mDue <= std::chrono::steady_clock::now()) {
-                    delayedTask = state.mDelayedTasks.top().mTask;
-                    state.mDelayedTasks.pop();
+                    && state.mDelayedTasks.front().mDue <= std::chrono::steady_clock::now()) {
+                    std::pop_heap(state.mDelayedTasks.begin(), state.mDelayedTasks.end(), DelayedEntryCompare{});
+                    delayedTask = std::move(state.mDelayedTasks.back().mTask);
+                    state.mDelayedTasks.pop_back();
+                    hasDelayedTask = true;
                 }
             }
 
-            if (!delayedTask) {
+            if (!hasDelayedTask) {
                 break;
             }
 
-            (*delayedTask)();
+            delayedTask();
         }
 
         if (mStopping.load(std::memory_order_acquire) || stopToken.stop_requested()) {
@@ -84,20 +87,23 @@ void ThreadPool::workerLoop(std::stop_token stopToken, std::size_t workerIndex) 
             }
 
             for (;;) {
-                std::shared_ptr<Task> delayedTask{};
+                Task delayedTask{};
+                bool hasDelayedTask = false;
                 {
                     std::lock_guard lock{state.mDelayedMutex};
                     if (!state.mDelayedTasks.empty()) {
-                        delayedTask = state.mDelayedTasks.top().mTask;
-                        state.mDelayedTasks.pop();
+                        std::pop_heap(state.mDelayedTasks.begin(), state.mDelayedTasks.end(), DelayedEntryCompare{});
+                        delayedTask = std::move(state.mDelayedTasks.back().mTask);
+                        state.mDelayedTasks.pop_back();
+                        hasDelayedTask = true;
                     }
                 }
 
-                if (!delayedTask) {
+                if (!hasDelayedTask) {
                     break;
                 }
 
-                (*delayedTask)();
+                delayedTask();
             }
 
             return;
@@ -108,7 +114,7 @@ void ThreadPool::workerLoop(std::stop_token stopToken, std::size_t workerIndex) 
             std::lock_guard lock{state.mDelayedMutex};
             if (!state.mDelayedTasks.empty()) {
                 const auto now = std::chrono::steady_clock::now();
-                const auto due = state.mDelayedTasks.top().mDue;
+                const auto due = state.mDelayedTasks.front().mDue;
                 waitFor        = due <= now ? std::chrono::steady_clock::duration::zero() : (due - now);
             }
         }

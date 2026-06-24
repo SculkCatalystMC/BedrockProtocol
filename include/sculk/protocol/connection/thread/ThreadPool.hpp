@@ -7,6 +7,7 @@
 
 #pragma once
 #include "sculk/protocol/Version.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <concepts>
@@ -15,7 +16,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <semaphore>
 #include <thread>
 #include <type_traits>
@@ -71,7 +71,7 @@ private:
     struct DelayedEntry final {
         std::chrono::steady_clock::time_point mDue{};
         std::uint64_t                         mSeq{};
-        std::shared_ptr<Task>                 mTask{};
+        Task                                  mTask{};
     };
 
     struct DelayedEntryCompare final {
@@ -84,11 +84,11 @@ private:
     };
 
     struct WorkerState final {
-        moodycamel::ConcurrentQueue<Task>                                                 mTasks{};
-        std::counting_semaphore<1024 * 1024>                                              mSignal{0};
-        std::mutex                                                                        mDelayedMutex{};
-        std::priority_queue<DelayedEntry, std::vector<DelayedEntry>, DelayedEntryCompare> mDelayedTasks{};
-        std::atomic_uint64_t                                                              mDelayedSeq{0};
+        moodycamel::ConcurrentQueue<Task>    mTasks{};
+        std::counting_semaphore<1024 * 1024> mSignal{0};
+        std::mutex                           mDelayedMutex{};
+        std::vector<DelayedEntry>            mDelayedTasks{};
+        std::atomic_uint64_t                 mDelayedSeq{0};
     };
 
 public:
@@ -176,8 +176,9 @@ public:
             DelayedEntry    entry{};
             entry.mDue  = std::chrono::steady_clock::now() + delay;
             entry.mSeq  = workerState.mDelayedSeq.fetch_add(1, std::memory_order_relaxed);
-            entry.mTask = std::make_shared<Task>(Task([task = std::forward<F>(task)]() mutable noexcept { task(); }));
-            workerState.mDelayedTasks.push(std::move(entry));
+            entry.mTask = Task([task = std::forward<F>(task)]() mutable noexcept { task(); });
+            workerState.mDelayedTasks.push_back(std::move(entry));
+            std::push_heap(workerState.mDelayedTasks.begin(), workerState.mDelayedTasks.end(), DelayedEntryCompare{});
         }
 
         if (mInFlightSubmissions.fetch_sub(1, std::memory_order_acq_rel) == 1) {

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -110,6 +111,9 @@ public:
                 if (delay > std::chrono::steady_clock::duration::zero()) {
                     std::this_thread::sleep_for(delay);
                 }
+            } else {
+                state->mPendingTasks.fetch_sub(1, std::memory_order_acq_rel);
+                return false;
             }
         }
 

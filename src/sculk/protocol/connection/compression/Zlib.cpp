@@ -12,7 +12,7 @@
 
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE::compression::zlib {
 
-#define ZLIB_STREAM_CHUNK 65536
+constexpr std::size_t ZLIB_STREAM_CHUNK          = 65536;
 constexpr std::size_t ZLIB_MAX_DECOMPRESSED_SIZE = 64ull * 1024ull * 1024ull;
 
 std::vector<std::byte> compress(std::span<const std::byte> input) {
@@ -26,7 +26,7 @@ std::vector<std::byte> compress(std::span<const std::byte> input) {
     strm.next_in  = reinterpret_cast<Bytef*>(const_cast<std::byte*>(input.data()));
     strm.avail_in = static_cast<uInt>(input.size());
     std::vector<std::byte> output;
-    std::uint8_t           out_buffer[ZLIB_STREAM_CHUNK];
+    Bytef                  out_buffer[ZLIB_STREAM_CHUNK];
     int                    ret;
     do {
         strm.next_out  = out_buffer;
@@ -55,7 +55,7 @@ Result<std::vector<std::byte>> decompress(std::span<const std::byte> input) {
     zstr.next_in  = reinterpret_cast<Bytef*>(const_cast<std::byte*>(input.data()));
     zstr.avail_in = static_cast<uInt>(input.size());
     std::vector<std::byte> output;
-    uint8_t                out_buffer[ZLIB_STREAM_CHUNK];
+    Bytef                  out_buffer[ZLIB_STREAM_CHUNK];
     int                    ret;
     do {
         zstr.next_out  = out_buffer;
