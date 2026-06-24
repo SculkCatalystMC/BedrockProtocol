@@ -72,13 +72,8 @@ public:
 
     static constexpr std::uint32_t DEFAULT_MAX_PENDING_TASKS = 2048;
 
-    explicit TaskStrand(
-        ThreadPool*   threadPool      = nullptr,
-        std::uint32_t maxPendingTasks = DEFAULT_MAX_PENDING_TASKS
-    ) noexcept
+    explicit TaskStrand(ThreadPool& threadPool, std::uint32_t maxPendingTasks = DEFAULT_MAX_PENDING_TASKS) noexcept
     : mState(std::make_shared<State>(threadPool, maxPendingTasks)) {}
-
-    void setThreadPool(ThreadPool* threadPool) noexcept { mState->mThreadPool = threadPool; }
 
     void setMaxPendingTasks(std::uint32_t maxPendingTasks) noexcept {
         mState->mMaxPendingTasks.store(maxPendingTasks, std::memory_order_release);
@@ -118,18 +113,12 @@ public:
             }
         }
 
-        auto* pool = state->mThreadPool;
-        if (!pool) {
-            state->mPendingTasks.fetch_sub(1, std::memory_order_acq_rel);
-            return false;
-        }
-
         if (!state->mTasks.enqueue(std::move(wrapped))) {
             state->mPendingTasks.fetch_sub(1, std::memory_order_acq_rel);
             return false;
         }
 
-        scheduleDrain(std::move(state), *pool);
+        scheduleDrain(std::move(state), state->mThreadPool);
         return true;
     }
 
@@ -139,11 +128,11 @@ public:
 
 private:
     struct State final {
-        explicit State(ThreadPool* threadPool, std::uint32_t maxPendingTasks) noexcept
+        explicit State(ThreadPool& threadPool, std::uint32_t maxPendingTasks) noexcept
         : mThreadPool(threadPool),
           mMaxPendingTasks(maxPendingTasks) {}
 
-        ThreadPool*                         mThreadPool{nullptr};
+        ThreadPool&                         mThreadPool;
         moodycamel::ConcurrentQueue<Task>   mTasks{};
         std::atomic_uint32_t                mMaxPendingTasks{DEFAULT_MAX_PENDING_TASKS};
         std::atomic_uint32_t                mPendingTasks{0};

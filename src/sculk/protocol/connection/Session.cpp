@@ -69,12 +69,12 @@ void Session::setEncrypted(std::vector<std::byte>&& key) noexcept {
 }
 
 bool Session::sendPacket(BufferView buffer) {
+    Buffer           copied{buffer.begin(), buffer.end()};
+    std::scoped_lock lock{mMutex};
+
     if (!mConnected.load(std::memory_order_relaxed)) {
         return false;
     }
-
-    Buffer           copied{buffer.begin(), buffer.end()};
-    std::scoped_lock lock{mMutex};
 
     mOutboundPackets.push_back(std::move(copied));
 
@@ -82,11 +82,11 @@ bool Session::sendPacket(BufferView buffer) {
 }
 
 bool Session::sendPacket(Buffer&& buffer) {
+    std::scoped_lock lock{mMutex};
+
     if (!mConnected.load(std::memory_order_relaxed)) {
         return false;
     }
-
-    std::scoped_lock lock{mMutex};
 
     mOutboundPackets.push_back(std::move(buffer));
 
@@ -274,13 +274,6 @@ bool Session::sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept {
     );
 }
 
-bool Session::hasPendingInboundPackets() const noexcept { return mInboundPackets.size_approx() > 0; }
-
-bool Session::hasPendingOutboundPackets() const noexcept {
-    std::scoped_lock lock{mMutex};
-    return !mOutboundPackets.empty();
-}
-
 bool Session::isConnected() const noexcept { return mConnected.load(std::memory_order_relaxed); }
 
 RakNet::RakNetGUID Session::getGuid() const noexcept { return mRemote.rakNetGuid; }
@@ -368,6 +361,7 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
 void Session::disconnect() noexcept {
     const bool wasConnected = mConnected.exchange(false, std::memory_order_relaxed);
 
+    // Block producer-side enqueue operations while draining queues.
     {
         std::scoped_lock lock{mMutex};
         while (!mOutboundPackets.empty()) {
@@ -375,12 +369,12 @@ void Session::disconnect() noexcept {
             mOutboundPackets.pop_front();
             drainedOutbound.clear();
         }
-    }
 
-    // Drain pending queues on disconnect to promptly release retained buffers.
-    Buffer drained{};
-    while (mInboundPackets.try_dequeue(drained)) {
-        drained.clear();
+        // Drain pending queues on disconnect to promptly release retained buffers.
+        Buffer drained{};
+        while (mInboundPackets.try_dequeue(drained)) {
+            drained.clear();
+        }
     }
 
     if (!wasConnected) {
@@ -388,11 +382,13 @@ void Session::disconnect() noexcept {
     }
 
     if (mPeer) {
-        mPeer->CloseConnection(mRemote, true, 0, LOW_PRIORITY);
+        mPeer->CloseConnection(mRemote, true, 0, IMMEDIATE_PRIORITY);
     }
 }
 
 bool Session::enqueueInboundPacket(Buffer&& buffer) noexcept {
+    std::scoped_lock lock{mMutex};
+
     if (!mConnected.load(std::memory_order_relaxed)) {
         return false;
     }

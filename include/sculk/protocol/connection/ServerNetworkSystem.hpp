@@ -283,11 +283,11 @@ private:
     std::unique_ptr<thread::ThreadPool>                       mOwnedThreadPool{};
     thread::ThreadPool*                                       mThreadPool{};
     std::jthread                                              mIoPumpThread{};
-    std::atomic_bool                                          mRunning{false};
-    std::atomic_bool                                          mFlushPumpScheduled{false};
-    std::atomic_uint32_t                                      mPendingFlushJobs{0};
-    std::atomic_uint32_t                                      mPendingFlushWakeups{0};
-    std::atomic_uint32_t                                      mPendingSessionPacketTasks{0};
+    std::atomic_bool                                          mRunning{};
+    std::atomic_bool                                          mFlushPumpScheduled{};
+    std::atomic_uint32_t                                      mPendingFlushJobs{};
+    std::atomic_uint32_t                                      mPendingFlushWakeups{};
+    std::atomic_uint32_t                                      mPendingSessionPacketTasks{};
     std::size_t                                               mFlushReadyPerTick{};
     std::size_t                                               mRawIngressMaxPacketBytes{};
     std::size_t                                               mRawIngressMaxPacketsPerSecond{};

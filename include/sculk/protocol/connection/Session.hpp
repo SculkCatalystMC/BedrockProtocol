@@ -12,6 +12,7 @@
 #include "sculk/protocol/utility/Enum.hpp"
 #include "sculk/protocol/utility/Result.hpp"
 #include <RakPeerInterface.h>
+#include <atomic>
 #include <chrono>
 #include <concurrentqueue.h>
 #include <cstddef>
@@ -90,10 +91,6 @@ public:
 
 public:
     [[nodiscard]] bool sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept;
-
-    [[nodiscard]] bool hasPendingInboundPackets() const noexcept;
-
-    [[nodiscard]] bool hasPendingOutboundPackets() const noexcept;
 
     [[nodiscard]] bool enqueueInboundPacket(Buffer&& buffer) noexcept;
 

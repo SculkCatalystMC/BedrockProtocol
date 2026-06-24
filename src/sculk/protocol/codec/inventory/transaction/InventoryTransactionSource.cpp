@@ -11,42 +11,38 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 void InventoryTransactionSource::write(BinaryStream& stream) const {
     stream.writeEnum(mType, &BinaryStream::writeUnsignedVarInt);
+    stream.writeBool(true); // unknown flag, should always be true
     stream.writeOptional(mContainerId, [&](BinaryStream& stream, const std::uint8_t& value) {
-        if (mType == InventoryTransactionSourceType::ContainerInventory
-            || mType == InventoryTransactionSourceType::NonImplementedFeatureTODO) {
-            stream.writeBool(true);
-            stream.writeByte(value);
-        } else {
-            stream.writeBool(false);
-        }
+        stream.writeByte(value);
     });
+    stream.writeBool(true); // unknown flag, should always be true
     stream.writeOptional(mBitFlags, [&](BinaryStream& stream, std::uint32_t const& value) {
-        if (mType == InventoryTransactionSourceType::WorldInteraction) {
-            stream.writeBool(true);
-            stream.writeUnsignedVarInt(value);
-        } else {
-            stream.writeBool(false);
-        }
+        stream.writeUnsignedVarInt(value);
     });
 }
 
 Result<> InventoryTransactionSource::read(ReadOnlyBinaryStream& stream) {
     _SCULK_READ(stream.readEnum(mType, &ReadOnlyBinaryStream::readUnsignedVarInt));
-    bool hasContainerId{};
-    bool shouldWriteContainerId{};
-    _SCULK_READ(stream.readBool(hasContainerId));
-    _SCULK_READ(stream.readBool(shouldWriteContainerId));
-    if (hasContainerId && shouldWriteContainerId) {
-        _SCULK_READ(stream.readByte(mContainerId.emplace()));
+
+    bool unknownFlag1{};
+    _SCULK_READ(stream.readBool(unknownFlag1));
+    if (!unknownFlag1) {
+        return error_utils::makeError("Expected container id");
     }
-    bool hasBitFlags{};
-    bool shouldWriteBitFlags{};
-    _SCULK_READ(stream.readBool(hasBitFlags));
-    _SCULK_READ(stream.readBool(shouldWriteBitFlags));
-    if (hasBitFlags && shouldWriteBitFlags) {
-        _SCULK_READ(stream.readUnsignedVarInt(mBitFlags.emplace()));
+
+    _SCULK_READ(stream.readOptional(mContainerId, [&](ReadOnlyBinaryStream& stream, std::uint8_t& value) {
+        return stream.readByte(value);
+    }));
+
+    bool unknownFlag2{};
+    _SCULK_READ(stream.readBool(unknownFlag2));
+    if (!unknownFlag2) {
+        return error_utils::makeError("Expected bit flags");
     }
-    return {};
+
+    return stream.readOptional(mBitFlags, [&](ReadOnlyBinaryStream& stream, std::uint32_t& value) {
+        return stream.readUnsignedVarInt(value);
+    });
 }
 
 void InventoryTransactionSource::writeLegacy(BinaryStream& stream) const {

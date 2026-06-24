@@ -46,7 +46,7 @@ public:
     TriggerType                mTriggerType{};
     BlockPos                   mPos{};
     std::uint32_t              mTargetBlockId{};
-    std::uint32_t              mFace{};
+    std::uint8_t               mFace{};
     std::int32_t               mSlot{};
     NetworkItemStackDescriptor mItem{};
     Vec3                       mFromPos{};

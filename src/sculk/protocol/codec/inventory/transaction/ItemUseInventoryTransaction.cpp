@@ -14,7 +14,7 @@ void ItemUseInventoryTransaction::write(BinaryStream& stream) const {
     stream.writeEnum(mActionType, &BinaryStream::writeVarInt);
     stream.writeEnum(mTriggerType, &BinaryStream::writeUnsignedVarInt);
     mPos.write(stream);
-    stream.writeUnsignedVarInt(mFace);
+    stream.writeByte(mFace);
     stream.writeVarInt(mSlot);
     mItem.writeCereal(stream);
     mFromPos.write(stream);
@@ -29,7 +29,7 @@ Result<> ItemUseInventoryTransaction::read(ReadOnlyBinaryStream& stream) {
     _SCULK_READ(stream.readEnum(mActionType, &ReadOnlyBinaryStream::readVarInt));
     _SCULK_READ(stream.readEnum(mTriggerType, &ReadOnlyBinaryStream::readUnsignedVarInt));
     _SCULK_READ(mPos.read(stream));
-    _SCULK_READ(stream.readUnsignedVarInt(mFace));
+    _SCULK_READ(stream.readByte(mFace));
     _SCULK_READ(stream.readVarInt(mSlot));
     _SCULK_READ(mItem.readCereal(stream));
     _SCULK_READ(mFromPos.read(stream));
@@ -44,7 +44,7 @@ void ItemUseInventoryTransaction::writeLegacy(BinaryStream& stream) const {
     stream.writeEnum(mActionType, &BinaryStream::writeUnsignedVarInt);
     stream.writeEnum(mTriggerType, &BinaryStream::writeUnsignedVarInt);
     mPos.write(stream);
-    stream.writeVarInt(mFace);
+    stream.writeVarInt(static_cast<std::int32_t>(mFace));
     stream.writeVarInt(mSlot);
     mItem.write(stream);
     mFromPos.write(stream);
@@ -61,7 +61,7 @@ Result<> ItemUseInventoryTransaction::readLegacy(ReadOnlyBinaryStream& stream) {
     _SCULK_READ(mPos.read(stream));
     std::int32_t face{};
     _SCULK_READ(stream.readVarInt(face));
-    mFace = static_cast<std::uint32_t>(face);
+    mFace = static_cast<std::uint8_t>(face);
     _SCULK_READ(stream.readVarInt(mSlot));
     _SCULK_READ(mItem.read(stream));
     _SCULK_READ(mFromPos.read(stream));

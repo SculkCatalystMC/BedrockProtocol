@@ -28,7 +28,7 @@ ClientNetworkSystem::ClientNetworkSystem(std::size_t workerThreadCount)
 : mPeer(RakNet::RakPeerInterface::GetInstance()),
   mOwnedThreadPool(std::make_unique<thread::ThreadPool>(workerThreadCount)),
   mThreadPool(mOwnedThreadPool.get()),
-  mCallbackStrand(mThreadPool),
+  mCallbackStrand(*mThreadPool),
   mRawIngressMaxPacketBytes(DEFAULT_RAW_INGRESS_MAX_PACKET_BYTES),
   mRawIngressMaxPacketsPerSecond(DEFAULT_RAW_INGRESS_MAX_PACKETS_PER_SECOND),
   mSession(std::shared_ptr<Session>{}),
@@ -38,7 +38,7 @@ ClientNetworkSystem::ClientNetworkSystem(thread::ThreadPool& threadPool)
 : mPeer(RakNet::RakPeerInterface::GetInstance()),
   mOwnedThreadPool(nullptr),
   mThreadPool(&threadPool),
-  mCallbackStrand(mThreadPool),
+  mCallbackStrand(*mThreadPool),
   mRawIngressMaxPacketBytes(DEFAULT_RAW_INGRESS_MAX_PACKET_BYTES),
   mRawIngressMaxPacketsPerSecond(DEFAULT_RAW_INGRESS_MAX_PACKETS_PER_SECOND),
   mSession(std::shared_ptr<Session>{}),
@@ -117,6 +117,9 @@ void ClientNetworkSystem::disconnect() {
         session->disconnect();
         mSession.store(nullptr, std::memory_order_release);
     }
+
+    mRawIngressWindowStart   = {};
+    mRawIngressWindowPackets = 0;
 }
 
 bool ClientNetworkSystem::isRunning() const noexcept { return mRunning.load(std::memory_order_acquire); }
@@ -359,16 +362,28 @@ void ClientNetworkSystem::waitForPendingDelayedWakeups() noexcept {
 void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
     auto callbacks = mCallbacks.load(std::memory_order_acquire);
 
+    auto resetIngressWindow = [this]() noexcept {
+        mRawIngressWindowStart   = {};
+        mRawIngressWindowPackets = 0;
+    };
+
+    auto disconnectSession = [this, &resetIngressWindow]() noexcept {
+        auto session = mSession.load(std::memory_order_acquire);
+        if (session) {
+            session->disconnect();
+            mSession.store(nullptr, std::memory_order_release);
+        }
+        resetIngressWindow();
+    };
+
     if (!packet.data || packet.length == 0) {
         bool shouldDisconnect = true;
         if (callbacks->mOnRawIngressLimitExceeded) {
             shouldDisconnect = callbacks->mOnRawIngressLimitExceeded(0, 0);
         }
 
-        auto session = mSession.load(std::memory_order_acquire);
-        if (shouldDisconnect && session) {
-            session->disconnect();
-            mSession.store(nullptr, std::memory_order_release);
+        if (shouldDisconnect) {
+            disconnectSession();
         }
         return;
     }
@@ -383,10 +398,8 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
             );
         }
 
-        auto session = mSession.load(std::memory_order_acquire);
-        if (shouldDisconnect && session) {
-            session->disconnect();
-            mSession.store(nullptr, std::memory_order_release);
+        if (shouldDisconnect) {
+            disconnectSession();
         }
         return;
     }
@@ -406,10 +419,8 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
             );
         }
 
-        auto session = mSession.load(std::memory_order_acquire);
-        if (shouldDisconnect && session) {
-            session->disconnect();
-            mSession.store(nullptr, std::memory_order_release);
+        if (shouldDisconnect) {
+            disconnectSession();
         }
         return;
     }
@@ -421,8 +432,12 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
     if (messageId == DefaultMessageIDTypes::ID_CONNECTION_REQUEST_ACCEPTED) {
         auto session = std::make_shared<Session>(mPeer.get(), RakNet::AddressOrGUID{&packet});
         mSession.store(session, std::memory_order_release);
+        resetIngressWindow();
         if (callbacks->mOnConnected) {
-            (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnected(); });
+            const bool enqueued = mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnected(); });
+            if (!enqueued) {
+                callbacks->mOnConnected();
+            }
         }
         return;
     }
@@ -430,14 +445,13 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
     if (messageId == DefaultMessageIDTypes::ID_DISCONNECTION_NOTIFICATION
         || messageId == DefaultMessageIDTypes::ID_CONNECTION_LOST) {
 
-        auto session = mSession.load(std::memory_order_acquire);
-        if (session) {
-            session->disconnect();
-            mSession.store(nullptr, std::memory_order_release);
-        }
+        disconnectSession();
 
         if (callbacks->mOnDisconnected) {
-            (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnDisconnected(); });
+            const bool enqueued = mCallbackStrand.enqueue([callbacks]() { callbacks->mOnDisconnected(); });
+            if (!enqueued) {
+                callbacks->mOnDisconnected();
+            }
         }
         return;
     }
@@ -445,14 +459,13 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
     if (messageId == DefaultMessageIDTypes::ID_CONNECTION_ATTEMPT_FAILED
         || messageId == DefaultMessageIDTypes::ID_NO_FREE_INCOMING_CONNECTIONS) {
 
-        auto session = mSession.load(std::memory_order_acquire);
-        if (session) {
-            session->disconnect();
-            mSession.store(nullptr, std::memory_order_release);
-        }
+        disconnectSession();
 
         if (callbacks->mOnConnectionFailed) {
-            (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnectionFailed(); });
+            const bool enqueued = mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnectionFailed(); });
+            if (!enqueued) {
+                callbacks->mOnConnectionFailed();
+            }
         }
         return;
     }
