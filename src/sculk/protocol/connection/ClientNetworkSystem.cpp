@@ -16,8 +16,11 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 namespace {
 
-constexpr std::uint8_t MINECRAFT_BATCH_PACKET_ID = 0xFE;
-constexpr auto         IO_PUMP_IDLE_WAIT         = std::chrono::milliseconds(20);
+constexpr std::uint8_t MINECRAFT_BATCH_PACKET_ID                  = 0xFE;
+constexpr auto         IO_PUMP_IDLE_WAIT                          = std::chrono::milliseconds(20);
+constexpr auto         RAW_INGRESS_WINDOW                         = std::chrono::seconds(1);
+constexpr std::size_t  DEFAULT_RAW_INGRESS_MAX_PACKET_BYTES       = 8ULL * 1024ULL * 1024ULL;
+constexpr std::size_t  DEFAULT_RAW_INGRESS_MAX_PACKETS_PER_SECOND = 2048;
 
 } // namespace
 
@@ -26,6 +29,8 @@ ClientNetworkSystem::ClientNetworkSystem(std::size_t workerThreadCount)
   mOwnedThreadPool(std::make_unique<thread::ThreadPool>(workerThreadCount)),
   mThreadPool(mOwnedThreadPool.get()),
   mCallbackStrand(mThreadPool),
+  mRawIngressMaxPacketBytes(DEFAULT_RAW_INGRESS_MAX_PACKET_BYTES),
+  mRawIngressMaxPacketsPerSecond(DEFAULT_RAW_INGRESS_MAX_PACKETS_PER_SECOND),
   mSession(std::shared_ptr<Session>{}),
   mCallbacks(std::make_shared<CallbackSet>()) {}
 
@@ -34,6 +39,8 @@ ClientNetworkSystem::ClientNetworkSystem(thread::ThreadPool& threadPool)
   mOwnedThreadPool(nullptr),
   mThreadPool(&threadPool),
   mCallbackStrand(mThreadPool),
+  mRawIngressMaxPacketBytes(DEFAULT_RAW_INGRESS_MAX_PACKET_BYTES),
+  mRawIngressMaxPacketsPerSecond(DEFAULT_RAW_INGRESS_MAX_PACKETS_PER_SECOND),
   mSession(std::shared_ptr<Session>{}),
   mCallbacks(std::make_shared<CallbackSet>()) {}
 
@@ -53,6 +60,9 @@ NetworkStartResult ClientNetworkSystem::start() {
         mRunning.store(false, std::memory_order_release);
         return static_cast<NetworkStartResult>(startupResult);
     }
+
+    mRawIngressWindowStart   = {};
+    mRawIngressWindowPackets = 0;
 
     return NetworkStartResult::Success;
 }
@@ -192,6 +202,41 @@ Result<> ClientNetworkSystem::setOnRawPacketReceive(RawPacketReceiveCallback&& c
     return {};
 }
 
+Result<> ClientNetworkSystem::setOnRawIngressLimitExceeded(RawIngressLimitExceededCallback&& callback) noexcept {
+    if (mRunning.load(std::memory_order_acquire)) {
+        return error_utils::makeError("Cannot set raw ingress limit callback while running");
+    }
+
+    auto callbacks                               = mCallbacks.load(std::memory_order_acquire);
+    auto updatedCallbacks                        = std::make_shared<CallbackSet>(*callbacks);
+    updatedCallbacks->mOnRawIngressLimitExceeded = std::move(callback);
+    mCallbacks.store(std::move(updatedCallbacks), std::memory_order_release);
+    return {};
+}
+
+Result<>
+ClientNetworkSystem::setRawIngressLimits(std::size_t maxPacketBytes, std::size_t maxPacketsPerSecond) noexcept {
+    if (mRunning.load(std::memory_order_acquire)) {
+        return error_utils::makeError("Cannot set raw ingress limits while running");
+    }
+
+    if (maxPacketBytes == 0 || maxPacketsPerSecond == 0) {
+        return error_utils::makeError("Raw ingress limits must be greater than zero");
+    }
+
+    mRawIngressMaxPacketBytes      = maxPacketBytes;
+    mRawIngressMaxPacketsPerSecond = maxPacketsPerSecond;
+    mRawIngressWindowStart         = {};
+    mRawIngressWindowPackets       = 0;
+    return {};
+}
+
+std::size_t ClientNetworkSystem::getRawIngressMaxPacketBytes() const noexcept { return mRawIngressMaxPacketBytes; }
+
+std::size_t ClientNetworkSystem::getRawIngressMaxPacketsPerSecond() const noexcept {
+    return mRawIngressMaxPacketsPerSecond;
+}
+
 Result<> ClientNetworkSystem::setOnPacketParseFailed(PacketParseFailedCallback&& callback) noexcept {
     if (mRunning.load(std::memory_order_acquire)) {
         return error_utils::makeError("Cannot set on packet parse failed callback while running");
@@ -312,16 +357,69 @@ void ClientNetworkSystem::waitForPendingDelayedWakeups() noexcept {
 }
 
 void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
+    auto callbacks = mCallbacks.load(std::memory_order_acquire);
+
     if (!packet.data || packet.length == 0) {
+        bool shouldDisconnect = true;
+        if (callbacks->mOnRawIngressLimitExceeded) {
+            shouldDisconnect = callbacks->mOnRawIngressLimitExceeded(0, 0);
+        }
+
+        auto session = mSession.load(std::memory_order_acquire);
+        if (shouldDisconnect && session) {
+            session->disconnect();
+            mSession.store(nullptr, std::memory_order_release);
+        }
         return;
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    if (packet.length > mRawIngressMaxPacketBytes) {
+        bool shouldDisconnect = true;
+        if (callbacks->mOnRawIngressLimitExceeded) {
+            shouldDisconnect = callbacks->mOnRawIngressLimitExceeded(
+                static_cast<std::size_t>(packet.length),
+                mRawIngressWindowPackets
+            );
+        }
+
+        auto session = mSession.load(std::memory_order_acquire);
+        if (shouldDisconnect && session) {
+            session->disconnect();
+            mSession.store(nullptr, std::memory_order_release);
+        }
+        return;
+    }
+
+    if (mRawIngressWindowStart == std::chrono::steady_clock::time_point{}
+        || now - mRawIngressWindowStart >= RAW_INGRESS_WINDOW) {
+        mRawIngressWindowStart   = now;
+        mRawIngressWindowPackets = 0;
+    }
+
+    if (mRawIngressWindowPackets >= mRawIngressMaxPacketsPerSecond) {
+        bool shouldDisconnect = true;
+        if (callbacks->mOnRawIngressLimitExceeded) {
+            shouldDisconnect = callbacks->mOnRawIngressLimitExceeded(
+                static_cast<std::size_t>(packet.length),
+                mRawIngressWindowPackets
+            );
+        }
+
+        auto session = mSession.load(std::memory_order_acquire);
+        if (shouldDisconnect && session) {
+            session->disconnect();
+            mSession.store(nullptr, std::memory_order_release);
+        }
+        return;
+    }
+
+    ++mRawIngressWindowPackets;
+
     const auto messageId = packet.data[0];
-    auto       callbacks = mCallbacks.load(std::memory_order_acquire);
 
     if (messageId == DefaultMessageIDTypes::ID_CONNECTION_REQUEST_ACCEPTED) {
-        auto remote  = RakNet::AddressOrGUID{&packet};
-        auto session = std::make_shared<Session>(mPeer.get(), remote);
+        auto session = std::make_shared<Session>(mPeer.get(), RakNet::AddressOrGUID{&packet});
         mSession.store(session, std::memory_order_release);
         if (callbacks->mOnConnected) {
             (void)mCallbackStrand.enqueue([callbacks]() { callbacks->mOnConnected(); });

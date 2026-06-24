@@ -26,7 +26,7 @@ std::vector<std::byte> compress(std::span<const std::byte> input) {
     strm.next_in  = reinterpret_cast<Bytef*>(const_cast<std::byte*>(input.data()));
     strm.avail_in = static_cast<uInt>(input.size());
     std::vector<std::byte> output;
-    unsigned char          out_buffer[ZLIB_STREAM_CHUNK];
+    std::uint8_t           out_buffer[ZLIB_STREAM_CHUNK];
     int                    ret;
     do {
         strm.next_out  = out_buffer;

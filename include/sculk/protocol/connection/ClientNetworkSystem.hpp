@@ -29,11 +29,12 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 class ClientNetworkSystem final {
 public:
-    using ConnectionEventCallback      = std::function<void()>;
-    using RawPacketReceiveCallback     = std::function<bool(Session::Buffer& payload)>;
-    using PacketReceiveCallback        = std::function<void(std::unique_ptr<IPacket>&& packet)>;
-    using PacketParseFailedCallback    = std::function<void(MinecraftPacketIds id, std::string_view message)>;
-    using TaskStrandBackpressurePolicy = thread::TaskStrand::BackpressurePolicy;
+    using ConnectionEventCallback         = std::function<void()>;
+    using RawPacketReceiveCallback        = std::function<bool(Session::Buffer& payload)>;
+    using PacketReceiveCallback           = std::function<void(std::unique_ptr<IPacket>&& packet)>;
+    using PacketParseFailedCallback       = std::function<void(MinecraftPacketIds id, std::string_view message)>;
+    using TaskStrandBackpressurePolicy    = thread::TaskStrand::BackpressurePolicy;
+    using RawIngressLimitExceededCallback = std::function<bool(std::size_t packetBytes, std::size_t packetsInWindow)>;
 
 public:
     explicit ClientNetworkSystem(std::size_t workerThreadCount = 0);
@@ -99,6 +100,20 @@ public:
     // processed further.
     Result<> setOnRawPacketReceive(RawPacketReceiveCallback&& callback) noexcept;
 
+    // Sets the callback invoked when raw ingress limits are exceeded.
+    // The callback return value decides whether the connection is disconnected.
+    Result<> setOnRawIngressLimitExceeded(RawIngressLimitExceededCallback&& callback) noexcept;
+
+    // Sets the raw ingress limits used before packet parsing.
+    // This option can only be configured before start().
+    Result<> setRawIngressLimits(std::size_t maxPacketBytes, std::size_t maxPacketsPerSecond) noexcept;
+
+    // Returns the maximum raw packet size accepted before parsing.
+    [[nodiscard]] std::size_t getRawIngressMaxPacketBytes() const noexcept;
+
+    // Returns the maximum number of raw packets accepted per second.
+    [[nodiscard]] std::size_t getRawIngressMaxPacketsPerSecond() const noexcept;
+
     // Sets the backpressure policy used by the callback strand.
     Result<> setOnTaskPressure(TaskStrandBackpressurePolicy&& callback) noexcept;
 
@@ -114,12 +129,13 @@ private:
     };
 
     struct CallbackSet final {
-        ConnectionEventCallback   mOnConnected{};
-        ConnectionEventCallback   mOnDisconnected{};
-        ConnectionEventCallback   mOnConnectionFailed{};
-        PacketReceiveCallback     mOnPacketReceive{};
-        PacketParseFailedCallback mOnPacketParseFailed{};
-        RawPacketReceiveCallback  mOnRawPacketReceive{};
+        ConnectionEventCallback         mOnConnected{};
+        ConnectionEventCallback         mOnDisconnected{};
+        ConnectionEventCallback         mOnConnectionFailed{};
+        PacketReceiveCallback           mOnPacketReceive{};
+        PacketParseFailedCallback       mOnPacketParseFailed{};
+        RawPacketReceiveCallback        mOnRawPacketReceive{};
+        RawIngressLimitExceededCallback mOnRawIngressLimitExceeded{};
     };
 
 private:
@@ -168,6 +184,10 @@ private:
     std::atomic_bool                                          mIoPumpScheduled{false};
     std::atomic_uint32_t                                      mPendingIoJobs{0};
     std::atomic_uint32_t                                      mPendingDelayedWakeups{0};
+    std::size_t                                               mRawIngressMaxPacketBytes{};
+    std::size_t                                               mRawIngressMaxPacketsPerSecond{};
+    std::chrono::steady_clock::time_point                     mRawIngressWindowStart{};
+    std::size_t                                               mRawIngressWindowPackets{0};
     AtomicSharedPtr<Session>                                  mSession{};
     AtomicSharedPtr<CallbackSet>                              mCallbacks{};
 };

@@ -139,9 +139,9 @@ std::string base64Encode(std::span<const std::byte> data) {
     const auto  encodedSize = 4 * ((data.size() + 2) / 3);
     std::string encoded(encodedSize, '\0');
 
-    const auto* input = reinterpret_cast<const unsigned char*>(data.data());
+    const auto* input = reinterpret_cast<const std::uint8_t*>(data.data());
     const auto  written =
-        EVP_EncodeBlock(reinterpret_cast<unsigned char*>(encoded.data()), input, static_cast<int>(data.size()));
+        EVP_EncodeBlock(reinterpret_cast<std::uint8_t*>(encoded.data()), input, static_cast<int>(data.size()));
 
     if (written < 0) {
         return {};
@@ -159,7 +159,7 @@ std::vector<std::byte> base64Decode(std::string_view data) {
     std::string compact;
     compact.reserve(data.size());
     for (char ch : data) {
-        if (!std::isspace(static_cast<unsigned char>(ch))) {
+        if (!std::isspace(static_cast<std::uint8_t>(ch))) {
             compact.push_back(ch);
         }
     }
@@ -168,10 +168,10 @@ std::vector<std::byte> base64Decode(std::string_view data) {
         return {};
     }
 
-    std::vector<unsigned char> decodedBuffer((compact.size() / 4) * 3);
-    const auto                 written = EVP_DecodeBlock(
+    std::vector<std::uint8_t> decodedBuffer((compact.size() / 4) * 3);
+    const auto                written = EVP_DecodeBlock(
         decodedBuffer.data(),
-        reinterpret_cast<const unsigned char*>(compact.data()),
+        reinterpret_cast<const std::uint8_t*>(compact.data()),
         static_cast<int>(compact.size())
     );
 

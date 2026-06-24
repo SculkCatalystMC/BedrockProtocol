@@ -12,7 +12,6 @@
 #include "sculk/protocol/utility/Enum.hpp"
 #include "sculk/protocol/utility/Result.hpp"
 #include <RakPeerInterface.h>
-#include <atomic>
 #include <chrono>
 #include <concurrentqueue.h>
 #include <cstddef>
@@ -42,8 +41,6 @@ protected:
     RakNet::AddressOrGUID                 mRemote{};
     moodycamel::ConcurrentQueue<Buffer>   mInboundPackets{};
     std::deque<Buffer>                    mOutboundPackets{};
-    std::atomic_uint32_t                  mInboundQueuedPackets{0};
-    std::atomic_uint32_t                  mOutboundQueuedPackets{0};
     std::atomic_bool                      mConnected{};
     std::optional<CompressionAlgorithm>   mCompressionType{};
     std::int32_t                          mCompressionThreshold{};

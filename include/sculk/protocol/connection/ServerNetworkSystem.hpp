@@ -54,13 +54,19 @@ public:
         bool(const RakNet::RakNetGUID& guid, const RakNet::SystemAddress& address, Session::Buffer& payload)>;
     using PacketReceiveCallback = std::function<
         void(const RakNet::RakNetGUID& guid, const RakNet::SystemAddress& address, std::unique_ptr<IPacket>&& packet)>;
-    using PacketParseFailedCallback    = std::function<void(
+    using PacketParseFailedCallback       = std::function<void(
         const RakNet::RakNetGUID&    guid,
         const RakNet::SystemAddress& address,
         MinecraftPacketIds           id,
         std::string_view             message
     )>;
-    using TaskStrandBackpressurePolicy = thread::TaskStrand::BackpressurePolicy;
+    using TaskStrandBackpressurePolicy    = thread::TaskStrand::BackpressurePolicy;
+    using RawIngressLimitExceededCallback = std::function<bool(
+        const RakNet::RakNetGUID&    guid,
+        const RakNet::SystemAddress& address,
+        std::size_t                  packetBytes,
+        std::size_t                  packetsInWindow
+    )>;
 
 public:
     explicit ServerNetworkSystem(std::size_t workerThreadCount = 0);
@@ -135,11 +141,25 @@ public:
     // processed further.
     Result<> setOnRawPacketReceive(RawPacketReceiveCallback&& callback) noexcept;
 
+    // Sets the callback invoked when raw ingress limits are exceeded.
+    // The callback return value decides whether the connection is disconnected.
+    Result<> setOnRawIngressLimitExceeded(RawIngressLimitExceededCallback&& callback) noexcept;
+
     // Sets the callback invoked when packet parsing fails.
     Result<> setOnPacketParseFailed(PacketParseFailedCallback&& callback) noexcept;
 
     // Sets the backpressure policy used by newly created session strands.
     Result<> setOnTaskPressure(TaskStrandBackpressurePolicy&& callback) noexcept;
+
+    // Sets the raw ingress limits used before packet parsing.
+    // This option can only be configured before start().
+    Result<> setRawIngressLimits(std::size_t maxPacketBytes, std::size_t maxPacketsPerSecond) noexcept;
+
+    // Returns the maximum raw packet size accepted before parsing.
+    [[nodiscard]] std::size_t getRawIngressMaxPacketBytes() const noexcept;
+
+    // Returns the maximum number of raw packets accepted per second.
+    [[nodiscard]] std::size_t getRawIngressMaxPacketsPerSecond() const noexcept;
 
     // Returns a weak reference to the session for the given client GUID.
     [[nodiscard]] std::weak_ptr<Session> getSession(const RakNet::RakNetGUID& guid) const noexcept;
@@ -153,16 +173,19 @@ private:
     };
 
     struct CallbackSet final {
-        ConnectionEventCallback   mOnConnected{};
-        ConnectionEventCallback   mOnDisconnected{};
-        PacketReceiveCallback     mOnPacketReceive{};
-        PacketParseFailedCallback mOnPacketParseFailed{};
-        RawPacketReceiveCallback  mOnRawPacketReceive{};
+        ConnectionEventCallback         mOnConnected{};
+        ConnectionEventCallback         mOnDisconnected{};
+        PacketReceiveCallback           mOnPacketReceive{};
+        PacketParseFailedCallback       mOnPacketParseFailed{};
+        RawPacketReceiveCallback        mOnRawPacketReceive{};
+        RawIngressLimitExceededCallback mOnRawIngressLimitExceeded{};
     };
 
     struct SessionContext final {
-        std::shared_ptr<Session>            mSession{};
-        std::shared_ptr<thread::TaskStrand> mStrand{};
+        std::shared_ptr<Session>              mSession{};
+        std::shared_ptr<thread::TaskStrand>   mStrand{};
+        std::chrono::steady_clock::time_point mRawIngressWindowStart{};
+        std::size_t                           mRawIngressWindowPackets{0};
     };
 
     struct FlushDueEntry final {
@@ -228,6 +251,15 @@ private:
 
     void processIncomingPacket(detail::RakPacketOwner packet);
 
+    void processSessionPacket(
+        const RakNet::RakNetGUID&                            key,
+        const RakNet::SystemAddress&                         address,
+        std::uint8_t                                         messageId,
+        std::shared_ptr<ServerNetworkSystem::SessionContext> sessionContext,
+        std::shared_ptr<ServerNetworkSystem::CallbackSet>    callbacks,
+        detail::RakPacketOwner                               packetOwner
+    ) noexcept;
+
     [[nodiscard]] std::shared_ptr<SessionContext> getSessionContext(const RakNet::RakNetGUID& guid) const noexcept;
 
     [[nodiscard]] std::shared_ptr<Session> getSessionShared(const RakNet::RakNetGUID& guid) const noexcept;
@@ -257,6 +289,8 @@ private:
     std::atomic_uint32_t                                      mPendingFlushWakeups{0};
     std::atomic_uint32_t                                      mPendingSessionPacketTasks{0};
     std::size_t                                               mFlushReadyPerTick{};
+    std::size_t                                               mRawIngressMaxPacketBytes{};
+    std::size_t                                               mRawIngressMaxPacketsPerSecond{};
     AtomicSharedPtr<TaskStrandBackpressurePolicy>             mTaskStrandBackpressurePolicy{};
     SessionContextsMap                                        mSessionContexts{};
     mutable std::mutex                                        mFlushScheduleMutex{};

@@ -77,7 +77,6 @@ bool Session::sendPacket(BufferView buffer) {
     std::scoped_lock lock{mMutex};
 
     mOutboundPackets.push_back(std::move(copied));
-    (void)mOutboundQueuedPackets.fetch_add(1, std::memory_order_acq_rel);
 
     return true;
 }
@@ -90,7 +89,6 @@ bool Session::sendPacket(Buffer&& buffer) {
     std::scoped_lock lock{mMutex};
 
     mOutboundPackets.push_back(std::move(buffer));
-    (void)mOutboundQueuedPackets.fetch_add(1, std::memory_order_acq_rel);
 
     return true;
 }
@@ -216,8 +214,6 @@ bool Session::receivePacket(Buffer& outBuffer) noexcept {
         return false;
     }
 
-    (void)mInboundQueuedPackets.fetch_sub(1, std::memory_order_acq_rel);
-
     outBuffer = std::move(packet);
     return true;
 }
@@ -278,12 +274,11 @@ bool Session::sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept {
     );
 }
 
-bool Session::hasPendingInboundPackets() const noexcept {
-    return mInboundQueuedPackets.load(std::memory_order_acquire) > 0;
-}
+bool Session::hasPendingInboundPackets() const noexcept { return mInboundPackets.size_approx() > 0; }
 
 bool Session::hasPendingOutboundPackets() const noexcept {
-    return mOutboundQueuedPackets.load(std::memory_order_acquire) > 0;
+    std::scoped_lock lock{mMutex};
+    return !mOutboundPackets.empty();
 }
 
 bool Session::isConnected() const noexcept { return mConnected.load(std::memory_order_relaxed); }
@@ -303,9 +298,12 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count()
     );
-    status.mConnected           = mConnected.load(std::memory_order_relaxed);
-    status.mInboundQueueApprox  = static_cast<std::size_t>(mInboundQueuedPackets.load(std::memory_order_acquire));
-    status.mOutboundQueueApprox = static_cast<std::size_t>(mOutboundQueuedPackets.load(std::memory_order_acquire));
+    status.mConnected          = mConnected.load(std::memory_order_relaxed);
+    status.mInboundQueueApprox = mInboundPackets.size_approx();
+    {
+        std::scoped_lock lock{mMutex};
+        status.mOutboundQueueApprox = mOutboundPackets.size();
+    }
 
     if (!mPeer || mRemote.IsUndefined()) {
         status.mConnectionState =
@@ -375,7 +373,6 @@ void Session::disconnect() noexcept {
         while (!mOutboundPackets.empty()) {
             auto drainedOutbound = std::move(mOutboundPackets.front());
             mOutboundPackets.pop_front();
-            (void)mOutboundQueuedPackets.fetch_sub(1, std::memory_order_acq_rel);
             drainedOutbound.clear();
         }
     }
@@ -383,7 +380,6 @@ void Session::disconnect() noexcept {
     // Drain pending queues on disconnect to promptly release retained buffers.
     Buffer drained{};
     while (mInboundPackets.try_dequeue(drained)) {
-        (void)mInboundQueuedPackets.fetch_sub(1, std::memory_order_acq_rel);
         drained.clear();
     }
 
@@ -405,7 +401,6 @@ bool Session::enqueueInboundPacket(Buffer&& buffer) noexcept {
         return false;
     }
 
-    (void)mInboundQueuedPackets.fetch_add(1, std::memory_order_acq_rel);
     return true;
 }
 
