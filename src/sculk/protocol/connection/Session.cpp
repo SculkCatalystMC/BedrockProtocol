@@ -69,27 +69,49 @@ void Session::setEncrypted(std::vector<std::byte>&& key) noexcept {
 }
 
 bool Session::sendPacket(BufferView buffer) {
-    std::scoped_lock lock{mMutex};
+    mActiveOutboundEnqueues.fetch_add(1, std::memory_order_acq_rel);
 
     if (!mConnected.load(std::memory_order_relaxed)) {
+        if (mActiveOutboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            mActiveOutboundEnqueues.notify_all();
+        }
         return false;
     }
 
     Buffer copied{buffer.begin(), buffer.end()};
 
-    mOutboundPackets.push_back(std::move(copied));
+    const bool enqueued = mOutboundPackets.enqueue(std::move(copied));
+
+    if (mActiveOutboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        mActiveOutboundEnqueues.notify_all();
+    }
+
+    if (!enqueued) {
+        return false;
+    }
 
     return true;
 }
 
 bool Session::sendPacket(Buffer&& buffer) {
-    std::scoped_lock lock{mMutex};
+    mActiveOutboundEnqueues.fetch_add(1, std::memory_order_acq_rel);
 
     if (!mConnected.load(std::memory_order_relaxed)) {
+        if (mActiveOutboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            mActiveOutboundEnqueues.notify_all();
+        }
         return false;
     }
 
-    mOutboundPackets.push_back(std::move(buffer));
+    const bool enqueued = mOutboundPackets.enqueue(std::move(buffer));
+
+    if (mActiveOutboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        mActiveOutboundEnqueues.notify_all();
+    }
+
+    if (!enqueued) {
+        return false;
+    }
 
     return true;
 }
@@ -120,7 +142,7 @@ bool Session::flush() {
     {
         std::scoped_lock lock{mMutex};
         mNextFlushAt = std::chrono::steady_clock::now() + FLUSH_INTERVAL;
-        if (!dequeueOutboundUnlocked(outPackets)) {
+        if (!dequeueOutboundPackets(outPackets)) {
             return false;
         }
     }
@@ -147,7 +169,7 @@ bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
         }
 
         mNextFlushAt = now + FLUSH_INTERVAL;
-        if (!dequeueOutboundUnlocked(outPackets)) {
+        if (!dequeueOutboundPackets(outPackets)) {
             return false;
         }
     }
@@ -163,17 +185,18 @@ bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
     return sendBatchedBufferImmediately(std::move(packetsBuffer));
 }
 
-bool Session::dequeueOutboundUnlocked(OutboundBuffers& outPackets) noexcept {
-    if (!mConnected.load(std::memory_order_relaxed) || !mPeer || mOutboundPackets.empty()) {
+bool Session::dequeueOutboundPackets(OutboundBuffers& outPackets) noexcept {
+    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
         return false;
     }
 
     outPackets.clear();
-    outPackets.reserve(mOutboundPackets.size());
+    outPackets.reserve(mOutboundPackets.size_approx());
 
-    while (!mOutboundPackets.empty()) {
-        outPackets.push_back(std::move(mOutboundPackets.front()));
-        mOutboundPackets.pop_front();
+    Buffer packet{};
+    while (mOutboundPackets.try_dequeue(packet)) {
+        outPackets.push_back(std::move(packet));
+        packet.clear();
     }
 
     return !outPackets.empty();
@@ -181,7 +204,7 @@ bool Session::dequeueOutboundUnlocked(OutboundBuffers& outPackets) noexcept {
 
 bool Session::flushPendingBeforeStateChangeUnlocked() noexcept {
     OutboundBuffers outPackets{};
-    if (!dequeueOutboundUnlocked(outPackets)) {
+    if (!dequeueOutboundPackets(outPackets)) {
         return false;
     }
 
@@ -283,12 +306,9 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count()
     );
-    status.mConnected          = mConnected.load(std::memory_order_relaxed);
-    status.mInboundQueueApprox = mInboundPackets.size_approx();
-    {
-        std::scoped_lock lock{mMutex};
-        status.mOutboundQueueApprox = mOutboundPackets.size();
-    }
+    status.mConnected           = mConnected.load(std::memory_order_relaxed);
+    status.mInboundQueueApprox  = mInboundPackets.size_approx();
+    status.mOutboundQueueApprox = mOutboundPackets.size_approx();
 
     if (!mPeer || mRemote.IsUndefined()) {
         status.mConnectionState =
@@ -351,14 +371,19 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
 }
 
 void Session::disconnect() noexcept {
-    const bool wasConnected = mConnected.exchange(false, std::memory_order_relaxed);
+    const bool wasConnected = mConnected.exchange(false, std::memory_order_acq_rel);
+
+    auto pending = mActiveOutboundEnqueues.load(std::memory_order_acquire);
+    while (pending != 0) {
+        mActiveOutboundEnqueues.wait(pending, std::memory_order_acquire);
+        pending = mActiveOutboundEnqueues.load(std::memory_order_acquire);
+    }
 
     // Block producer-side enqueue operations while draining queues.
     {
         std::scoped_lock lock{mMutex};
-        while (!mOutboundPackets.empty()) {
-            auto drainedOutbound = std::move(mOutboundPackets.front());
-            mOutboundPackets.pop_front();
+        Buffer           drainedOutbound{};
+        while (mOutboundPackets.try_dequeue(drainedOutbound)) {
             drainedOutbound.clear();
         }
 

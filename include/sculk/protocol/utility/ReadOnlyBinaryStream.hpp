@@ -59,7 +59,7 @@ private:
             sizeof(T),
             reinterpret_cast<char*>(target)
         );
-        *target = endian::fromLittleEndian(*target);
+        *target      = endian::fromLittleEndian(*target);
         mReadPointer = newReadPointer;
         return {};
     }

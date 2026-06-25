@@ -17,7 +17,6 @@
 #include <concurrentqueue.h>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -41,8 +40,9 @@ protected:
     RakNet::RakPeerInterface*             mPeer{};
     RakNet::AddressOrGUID                 mRemote{};
     moodycamel::ConcurrentQueue<Buffer>   mInboundPackets{};
-    std::deque<Buffer>                    mOutboundPackets{};
+    moodycamel::ConcurrentQueue<Buffer>   mOutboundPackets{};
     std::atomic_bool                      mConnected{};
+    std::atomic_uint32_t                  mActiveOutboundEnqueues{};
     std::optional<CompressionAlgorithm>   mCompressionType{};
     std::int32_t                          mCompressionThreshold{};
     std::optional<CryptoManager>          mEncryption{};
@@ -103,7 +103,7 @@ public:
 private:
     [[nodiscard]] bool flushPendingBeforeStateChangeUnlocked() noexcept;
 
-    [[nodiscard]] bool dequeueOutboundUnlocked(OutboundBuffers& outPackets) noexcept;
+    [[nodiscard]] bool dequeueOutboundPackets(OutboundBuffers& outPackets) noexcept;
 };
 
 } // namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE
