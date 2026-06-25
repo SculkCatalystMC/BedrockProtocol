@@ -23,14 +23,14 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 namespace {
 
-constexpr std::uint8_t       MINECRAFT_BATCH_PACKET_ID                  = 0xFE;
-constexpr auto               IO_PUMP_IDLE_WAIT                          = std::chrono::milliseconds(1);
-constexpr auto               FLUSH_PUMP_IDLE_WAIT                       = std::chrono::milliseconds(1);
-constexpr auto               FLUSH_INTERVAL                             = std::chrono::milliseconds(20);
-constexpr auto               RAW_INGRESS_WINDOW                         = std::chrono::seconds(1);
-static constexpr std::size_t DEFAULT_FLUSH_READY_PER_TICK               = 512;
-constexpr std::size_t        DEFAULT_RAW_INGRESS_MAX_PACKET_BYTES       = 8ULL * 1024ULL * 1024ULL;
-constexpr std::size_t        DEFAULT_RAW_INGRESS_MAX_PACKETS_PER_SECOND = 128;
+constexpr std::uint8_t MINECRAFT_BATCH_PACKET_ID                  = 0xFE;
+constexpr auto         IO_PUMP_IDLE_WAIT                          = std::chrono::milliseconds(1);
+constexpr auto         FLUSH_PUMP_IDLE_WAIT                       = std::chrono::milliseconds(1);
+constexpr auto         FLUSH_INTERVAL                             = std::chrono::milliseconds(20);
+constexpr auto         RAW_INGRESS_WINDOW                         = std::chrono::seconds(1);
+constexpr std::size_t  DEFAULT_FLUSH_READY_PER_TICK               = 512;
+constexpr std::size_t  DEFAULT_RAW_INGRESS_MAX_PACKET_BYTES       = 8ULL * 1024ULL * 1024ULL;
+constexpr std::size_t  DEFAULT_RAW_INGRESS_MAX_PACKETS_PER_SECOND = 128;
 
 [[nodiscard]] auto flushPhaseOffsetForGuid(const RakNet::RakNetGUID& guid) noexcept {
     const auto intervalMs = std::chrono::duration_cast<std::chrono::milliseconds>(FLUSH_INTERVAL).count();
@@ -752,7 +752,7 @@ void ServerNetworkSystem::processIncomingPacket(detail::RakPacketOwner packetOwn
 
     if (messageId == DefaultMessageIDTypes::ID_NEW_INCOMING_CONNECTION) {
         auto newSessionContext                      = std::make_shared<SessionContext>();
-        newSessionContext->mSession                 = std::make_shared<Session>(mPeer.get(), remote);
+        newSessionContext->mSession                 = std::make_shared<Session>(*mPeer, remote);
         newSessionContext->mStrand                  = std::make_shared<thread::TaskStrand>(*mThreadPool);
         newSessionContext->mRawIngressWindowStart   = std::chrono::steady_clock::time_point{};
         newSessionContext->mRawIngressWindowPackets = 0;

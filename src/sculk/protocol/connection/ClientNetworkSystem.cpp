@@ -430,7 +430,7 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
     const auto messageId = packet.data[0];
 
     if (messageId == DefaultMessageIDTypes::ID_CONNECTION_REQUEST_ACCEPTED) {
-        auto session = std::make_shared<Session>(mPeer.get(), RakNet::AddressOrGUID{&packet});
+        auto session = std::make_shared<Session>(*mPeer, RakNet::AddressOrGUID{&packet});
         mSession.store(session, std::memory_order_release);
         resetIngressWindow();
         if (callbacks->mOnConnected) {

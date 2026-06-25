@@ -17,7 +17,7 @@
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 #define SCULK_HANDSHAKE_TOKEN_SERIALIZE_OPTION_INIT()                                                                  \
-    static reflection::jsonc::options options {                                                                        \
+    constexpr reflection::jsonc::options options {                                                                     \
         .indent = -1, .allow_trailing_comma = false, .enum_cast_case_sensitive = true                                  \
     }
 

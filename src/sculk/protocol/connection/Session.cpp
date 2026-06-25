@@ -43,7 +43,7 @@ constexpr auto FLUSH_INTERVAL = std::chrono::milliseconds(20);
 
 } // namespace
 
-Session::Session(RakNet::RakPeerInterface* peer, const RakNet::AddressOrGUID& remote) noexcept
+Session::Session(RakNet::RakPeerInterface& peer, const RakNet::AddressOrGUID& remote) noexcept
 : mPeer(peer),
   mRemote(remote),
   mConnected(true),
@@ -54,8 +54,10 @@ Session::~Session() { disconnect(); }
 bool Session::isCompressed() const noexcept { return mCompressionType.has_value(); }
 
 void Session::setCompressed(CompressionAlgorithm type, std::int32_t threshold) noexcept {
-    std::scoped_lock lock{mMutex};
-    (void)flushPendingBeforeStateChangeUnlocked();
+    {
+        std::scoped_lock lock{mOutboundMutex};
+        (void)flushPendingBeforeStateChangeUnlocked();
+    }
     mCompressionType      = type;
     mCompressionThreshold = threshold;
 }
@@ -63,55 +65,34 @@ void Session::setCompressed(CompressionAlgorithm type, std::int32_t threshold) n
 bool Session::isEncrypted() const noexcept { return mEncryption.has_value(); }
 
 void Session::setEncrypted(std::vector<std::byte>&& key) noexcept {
-    std::scoped_lock lock{mMutex};
-    (void)flushPendingBeforeStateChangeUnlocked();
+    {
+        std::scoped_lock lock{mOutboundMutex};
+        (void)flushPendingBeforeStateChangeUnlocked();
+    }
     mEncryption.emplace(std::move(key));
 }
 
 bool Session::sendPacket(BufferView buffer) {
-    Buffer copied{buffer.begin(), buffer.end()};
-
-    mActiveOutboundEnqueues.fetch_add(1, std::memory_order_acq_rel);
+    Buffer           copied{buffer.begin(), buffer.end()};
+    std::scoped_lock lock{mOutboundMutex};
 
     if (!mConnected.load(std::memory_order_relaxed)) {
-        if (mActiveOutboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            mActiveOutboundEnqueues.notify_all();
-        }
         return false;
     }
 
-    const bool enqueued = mOutboundPackets.enqueue(std::move(copied));
-
-    if (mActiveOutboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        mActiveOutboundEnqueues.notify_all();
-    }
-
-    if (!enqueued) {
-        return false;
-    }
+    mOutboundPackets.push_back(std::move(copied));
 
     return true;
 }
 
 bool Session::sendPacket(Buffer&& buffer) {
-    mActiveOutboundEnqueues.fetch_add(1, std::memory_order_acq_rel);
+    std::scoped_lock lock{mOutboundMutex};
 
     if (!mConnected.load(std::memory_order_relaxed)) {
-        if (mActiveOutboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            mActiveOutboundEnqueues.notify_all();
-        }
         return false;
     }
 
-    const bool enqueued = mOutboundPackets.enqueue(std::move(buffer));
-
-    if (mActiveOutboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        mActiveOutboundEnqueues.notify_all();
-    }
-
-    if (!enqueued) {
-        return false;
-    }
+    mOutboundPackets.push_back(std::move(buffer));
 
     return true;
 }
@@ -137,20 +118,21 @@ bool Session::sendPacketImmediately(BufferView buffer) {
 }
 
 bool Session::flush() {
-    OutboundBuffers outPackets{};
+    std::deque<Buffer> drainedPackets{};
 
     {
-        std::scoped_lock lock{mMutex};
+        std::scoped_lock lock{mOutboundMutex};
         mNextFlushAt = std::chrono::steady_clock::now() + FLUSH_INTERVAL;
-        if (!dequeueOutboundPackets(outPackets)) {
+        if (!mConnected.load(std::memory_order_relaxed) || mOutboundPackets.empty()) {
             return false;
         }
+        drainedPackets.swap(mOutboundPackets);
     }
 
     Buffer       packetsBuffer{};
     BinaryStream packetStream{packetsBuffer};
 
-    for (const auto& packet : outPackets) {
+    for (const auto& packet : drainedPackets) {
         packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(packet.size()));
         packetStream.writeBytes(packet.data(), packet.size());
     }
@@ -159,25 +141,26 @@ bool Session::flush() {
 }
 
 bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
-    OutboundBuffers outPackets{};
+    std::deque<Buffer> drainedPackets{};
 
     {
-        std::scoped_lock lock{mMutex};
+        std::scoped_lock lock{mOutboundMutex};
 
         if (now < mNextFlushAt) {
             return false;
         }
 
         mNextFlushAt = now + FLUSH_INTERVAL;
-        if (!dequeueOutboundPackets(outPackets)) {
+        if (!mConnected.load(std::memory_order_relaxed) || mOutboundPackets.empty()) {
             return false;
         }
+        drainedPackets.swap(mOutboundPackets);
     }
 
     Buffer       packetsBuffer{};
     BinaryStream packetStream{packetsBuffer};
 
-    for (const auto& packet : outPackets) {
+    for (const auto& packet : drainedPackets) {
         packetStream.writeUnsignedVarInt(static_cast<std::uint32_t>(packet.size()));
         packetStream.writeBytes(packet.data(), packet.size());
     }
@@ -186,17 +169,16 @@ bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
 }
 
 bool Session::dequeueOutboundPackets(OutboundBuffers& outPackets) noexcept {
-    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
+    if (!mConnected.load(std::memory_order_relaxed) || mOutboundPackets.empty()) {
         return false;
     }
 
     outPackets.clear();
-    outPackets.reserve(mOutboundPackets.size_approx());
+    outPackets.reserve(mOutboundPackets.size());
 
-    Buffer packet{};
-    while (mOutboundPackets.try_dequeue(packet)) {
-        outPackets.push_back(std::move(packet));
-        packet.clear();
+    while (!mOutboundPackets.empty()) {
+        outPackets.push_back(std::move(mOutboundPackets.front()));
+        mOutboundPackets.pop_front();
     }
 
     return !outPackets.empty();
@@ -220,17 +202,18 @@ bool Session::flushPendingBeforeStateChangeUnlocked() noexcept {
 }
 
 bool Session::receivePacket(Buffer& outBuffer) noexcept {
-    Buffer packet{};
-    if (!mInboundPackets.try_dequeue(packet)) {
+    std::scoped_lock lock{mInboundMutex};
+    if (mInboundPackets.empty()) {
         return false;
     }
 
-    outBuffer = std::move(packet);
+    outBuffer = std::move(mInboundPackets.front());
+    mInboundPackets.pop_front();
     return true;
 }
 
 bool Session::sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept {
-    if (!mConnected.load(std::memory_order_relaxed) || !mPeer) {
+    if (!mConnected.load(std::memory_order_relaxed)) {
         return false;
     }
 
@@ -277,7 +260,7 @@ bool Session::sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept {
     framed.push_back(static_cast<std::byte>(MINECRAFT_BATCH_PACKET_ID));
     framed.insert(framed.end(), finalBuffer.begin(), finalBuffer.end());
 
-    return mPeer->Send(
+    return mPeer.Send(
         reinterpret_cast<const char*>(framed.data()),
         static_cast<int>(framed.size()),
         HIGH_PRIORITY,
@@ -306,11 +289,17 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count()
     );
-    status.mConnected           = mConnected.load(std::memory_order_relaxed);
-    status.mInboundQueueApprox  = mInboundPackets.size_approx();
-    status.mOutboundQueueApprox = mOutboundPackets.size_approx();
+    status.mConnected = mConnected.load(std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{mInboundMutex};
+        status.mInboundQueueApprox = mInboundPackets.size();
+    }
+    {
+        std::scoped_lock lock{mOutboundMutex};
+        status.mOutboundQueueApprox = mOutboundPackets.size();
+    }
 
-    if (!mPeer || mRemote.IsUndefined()) {
+    if (mRemote.IsUndefined()) {
         status.mConnectionState =
             status.mConnected ? NetworkStatus::ConnectionState::Unknown : NetworkStatus::ConnectionState::Disconnected;
         return status;
@@ -319,19 +308,19 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
     auto resolvedRemote = mRemote;
     if (resolvedRemote.systemAddress == RakNet::UNASSIGNED_SYSTEM_ADDRESS
         && resolvedRemote.rakNetGuid != RakNet::UNASSIGNED_RAKNET_GUID) {
-        resolvedRemote.systemAddress = mPeer->GetSystemAddressFromGuid(resolvedRemote.rakNetGuid);
+        resolvedRemote.systemAddress = mPeer.GetSystemAddressFromGuid(resolvedRemote.rakNetGuid);
     }
 
-    const auto peerState    = mPeer->GetConnectionState(resolvedRemote);
+    const auto peerState    = mPeer.GetConnectionState(resolvedRemote);
     status.mConnectionState = mapConnectionState(peerState);
     status.mConnected       = status.mConnected && (peerState == RakNet::IS_CONNECTED);
 
-    status.mAveragePingMs = mPeer->GetAveragePing(resolvedRemote);
-    status.mLastPingMs    = mPeer->GetLastPing(resolvedRemote);
-    status.mLowestPingMs  = mPeer->GetLowestPing(resolvedRemote);
+    status.mAveragePingMs = mPeer.GetAveragePing(resolvedRemote);
+    status.mLastPingMs    = mPeer.GetLastPing(resolvedRemote);
+    status.mLowestPingMs  = mPeer.GetLowestPing(resolvedRemote);
 
     RakNet::RakNetStatistics transportStats{};
-    auto*                    stats = mPeer->GetStatistics(resolvedRemote.systemAddress, &transportStats);
+    auto*                    stats = mPeer.GetStatistics(resolvedRemote.systemAddress, &transportStats);
     if (!stats) {
         return status;
     }
@@ -373,29 +362,19 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
 void Session::disconnect() noexcept {
     const bool wasConnected = mConnected.exchange(false, std::memory_order_acq_rel);
 
-    auto inboundPending = mActiveInboundEnqueues.load(std::memory_order_acquire);
-    while (inboundPending != 0) {
-        mActiveInboundEnqueues.wait(inboundPending, std::memory_order_acquire);
-        inboundPending = mActiveInboundEnqueues.load(std::memory_order_acquire);
-    }
-
-    auto pending = mActiveOutboundEnqueues.load(std::memory_order_acquire);
-    while (pending != 0) {
-        mActiveOutboundEnqueues.wait(pending, std::memory_order_acquire);
-        pending = mActiveOutboundEnqueues.load(std::memory_order_acquire);
-    }
-
     // Block producer-side enqueue operations while draining queues.
     {
-        std::scoped_lock lock{mMutex};
-        Buffer           drainedOutbound{};
-        while (mOutboundPackets.try_dequeue(drainedOutbound)) {
+        std::scoped_lock lock{mInboundMutex, mOutboundMutex};
+        while (!mOutboundPackets.empty()) {
+            auto drainedOutbound = std::move(mOutboundPackets.front());
+            mOutboundPackets.pop_front();
             drainedOutbound.clear();
         }
 
         // Drain pending queues on disconnect to promptly release retained buffers.
-        Buffer drained{};
-        while (mInboundPackets.try_dequeue(drained)) {
+        while (!mInboundPackets.empty()) {
+            auto drained = std::move(mInboundPackets.front());
+            mInboundPackets.pop_front();
             drained.clear();
         }
     }
@@ -404,30 +383,17 @@ void Session::disconnect() noexcept {
         return;
     }
 
-    if (mPeer) {
-        mPeer->CloseConnection(mRemote, true, 0, IMMEDIATE_PRIORITY);
-    }
+    mPeer.CloseConnection(mRemote, true, 0, IMMEDIATE_PRIORITY);
 }
 
 bool Session::enqueueInboundPacket(Buffer&& buffer) noexcept {
-    mActiveInboundEnqueues.fetch_add(1, std::memory_order_acq_rel);
+    std::scoped_lock lock{mInboundMutex};
 
     if (!mConnected.load(std::memory_order_relaxed)) {
-        if (mActiveInboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            mActiveInboundEnqueues.notify_all();
-        }
         return false;
     }
 
-    const bool enqueued = mInboundPackets.enqueue(std::move(buffer));
-
-    if (mActiveInboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        mActiveInboundEnqueues.notify_all();
-    }
-
-    if (!enqueued) {
-        return false;
-    }
+    mInboundPackets.push_back(std::move(buffer));
 
     return true;
 }

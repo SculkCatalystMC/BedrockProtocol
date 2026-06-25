@@ -320,8 +320,8 @@ Result<ConnectionRequest> ConnectionRequest::fromString(std::string_view rawRequ
         return error_utils::makeError("Failed to parse authentication JSON from ConnectionRequest");
     }
 
-    const auto&                       authJson = *authJsonOpt;
-    static reflection::jsonc::options options{
+    const auto&                          authJson = *authJsonOpt;
+    constexpr reflection::jsonc::options options{
         .indent                   = -1,
         .allow_trailing_comma     = false,
         .enum_cast_case_sensitive = true

@@ -14,9 +14,9 @@
 #include <RakPeerInterface.h>
 #include <atomic>
 #include <chrono>
-#include <concurrentqueue.h>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -32,23 +32,22 @@ public:
     using BatchedBuffer   = std::vector<Buffer>;
     using OutboundBuffers = std::vector<Buffer>;
 
-    explicit Session(RakNet::RakPeerInterface* peer, const RakNet::AddressOrGUID& remote) noexcept;
+    explicit Session(RakNet::RakPeerInterface& peer, const RakNet::AddressOrGUID& remote) noexcept;
 
     ~Session();
 
 protected:
-    RakNet::RakPeerInterface*             mPeer{};
+    RakNet::RakPeerInterface&             mPeer;
     RakNet::AddressOrGUID                 mRemote{};
-    moodycamel::ConcurrentQueue<Buffer>   mInboundPackets{};
-    moodycamel::ConcurrentQueue<Buffer>   mOutboundPackets{};
+    std::deque<Buffer>                    mInboundPackets{};
+    std::deque<Buffer>                    mOutboundPackets{};
     std::atomic_bool                      mConnected{};
-    std::atomic_uint32_t                  mActiveInboundEnqueues{};
-    std::atomic_uint32_t                  mActiveOutboundEnqueues{};
     std::optional<CompressionAlgorithm>   mCompressionType{};
     std::int32_t                          mCompressionThreshold{};
     std::optional<CryptoManager>          mEncryption{};
     std::chrono::steady_clock::time_point mNextFlushAt{};
-    mutable std::mutex                    mMutex{};
+    mutable std::mutex                    mInboundMutex{};
+    mutable std::mutex                    mOutboundMutex{};
 
     Session(const Session&)            = delete;
     Session& operator=(const Session&) = delete;
