@@ -42,6 +42,7 @@ protected:
     moodycamel::ConcurrentQueue<Buffer>   mInboundPackets{};
     moodycamel::ConcurrentQueue<Buffer>   mOutboundPackets{};
     std::atomic_bool                      mConnected{};
+    std::atomic_uint32_t                  mActiveInboundEnqueues{};
     std::atomic_uint32_t                  mActiveOutboundEnqueues{};
     std::optional<CompressionAlgorithm>   mCompressionType{};
     std::int32_t                          mCompressionThreshold{};

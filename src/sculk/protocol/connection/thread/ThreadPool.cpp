@@ -12,6 +12,12 @@ namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 namespace thread {
 
+namespace {
+
+constexpr std::size_t DEFAULT_DELAYED_TASK_RESERVE = 64;
+
+} // namespace
+
 ThreadPool::ThreadPool(std::size_t threadCount) {
     if (threadCount == 0) {
         threadCount = std::max<std::size_t>(1, std::thread::hardware_concurrency());
@@ -21,6 +27,7 @@ ThreadPool::ThreadPool(std::size_t threadCount) {
     mWorkers.reserve(threadCount);
     for (std::size_t i = 0; i < threadCount; ++i) {
         mWorkerStates.emplace_back(std::make_unique<WorkerState>());
+        mWorkerStates.back()->mDelayedTasks.reserve(DEFAULT_DELAYED_TASK_RESERVE);
         mWorkers.emplace_back([this, i](std::stop_token token) { workerLoop(token, i); });
     }
 }
@@ -111,9 +118,9 @@ void ThreadPool::workerLoop(std::stop_token stopToken, std::size_t workerIndex) 
 
         auto waitFor = std::chrono::steady_clock::duration::max();
         {
+            const auto      now = std::chrono::steady_clock::now();
             std::lock_guard lock{state.mDelayedMutex};
             if (!state.mDelayedTasks.empty()) {
-                const auto now = std::chrono::steady_clock::now();
                 const auto due = state.mDelayedTasks.front().mDue;
                 waitFor        = due <= now ? std::chrono::steady_clock::duration::zero() : (due - now);
             }

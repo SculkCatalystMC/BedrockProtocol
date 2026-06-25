@@ -69,6 +69,8 @@ void Session::setEncrypted(std::vector<std::byte>&& key) noexcept {
 }
 
 bool Session::sendPacket(BufferView buffer) {
+    Buffer copied{buffer.begin(), buffer.end()};
+
     mActiveOutboundEnqueues.fetch_add(1, std::memory_order_acq_rel);
 
     if (!mConnected.load(std::memory_order_relaxed)) {
@@ -77,8 +79,6 @@ bool Session::sendPacket(BufferView buffer) {
         }
         return false;
     }
-
-    Buffer copied{buffer.begin(), buffer.end()};
 
     const bool enqueued = mOutboundPackets.enqueue(std::move(copied));
 
@@ -373,6 +373,12 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
 void Session::disconnect() noexcept {
     const bool wasConnected = mConnected.exchange(false, std::memory_order_acq_rel);
 
+    auto inboundPending = mActiveInboundEnqueues.load(std::memory_order_acquire);
+    while (inboundPending != 0) {
+        mActiveInboundEnqueues.wait(inboundPending, std::memory_order_acquire);
+        inboundPending = mActiveInboundEnqueues.load(std::memory_order_acquire);
+    }
+
     auto pending = mActiveOutboundEnqueues.load(std::memory_order_acquire);
     while (pending != 0) {
         mActiveOutboundEnqueues.wait(pending, std::memory_order_acquire);
@@ -404,13 +410,22 @@ void Session::disconnect() noexcept {
 }
 
 bool Session::enqueueInboundPacket(Buffer&& buffer) noexcept {
-    std::scoped_lock lock{mMutex};
+    mActiveInboundEnqueues.fetch_add(1, std::memory_order_acq_rel);
 
     if (!mConnected.load(std::memory_order_relaxed)) {
+        if (mActiveInboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            mActiveInboundEnqueues.notify_all();
+        }
         return false;
     }
 
-    if (!mInboundPackets.enqueue(std::move(buffer))) {
+    const bool enqueued = mInboundPackets.enqueue(std::move(buffer));
+
+    if (mActiveInboundEnqueues.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        mActiveInboundEnqueues.notify_all();
+    }
+
+    if (!enqueued) {
         return false;
     }
 

@@ -15,6 +15,7 @@
 #include <RakPeerInterface.h>
 #include <atomic>
 #include <chrono>
+#include <concurrentqueue.h>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -203,6 +204,17 @@ private:
         }
     };
 
+    struct FlushScheduleCommand final {
+        enum class Kind : std::uint8_t {
+            Schedule,
+            Cancel,
+        };
+
+        Kind                                  mKind{Kind::Cancel};
+        RakNet::RakNetGUID                    mGuid{};
+        std::chrono::steady_clock::time_point mDue{};
+    };
+
     using SessionContextsMap =
         detail::ThreadSafeParallelFlatHashMap<RakNet::RakNetGUID, std::shared_ptr<SessionContext>>;
     using FlushDueTokenMap = phmap::flat_hash_map<RakNet::RakNetGUID, std::uint64_t>;
@@ -270,6 +282,12 @@ private:
 
     void clearFlushSchedule() noexcept;
 
+    void drainFlushScheduleCommands() noexcept;
+
+    void drainFlushScheduleCommandsUnlocked() noexcept;
+
+    void applyFlushScheduleCommandUnlocked(const FlushScheduleCommand& command) noexcept;
+
     void upsertSessionContext(const RakNet::RakNetGUID& key, std::shared_ptr<SessionContext> context);
 
     std::shared_ptr<SessionContext> removeSessionContext(const RakNet::RakNetGUID& key);
@@ -294,6 +312,7 @@ private:
     AtomicSharedPtr<TaskStrandBackpressurePolicy>             mTaskStrandBackpressurePolicy{};
     SessionContextsMap                                        mSessionContexts{};
     mutable std::mutex                                        mFlushScheduleMutex{};
+    moodycamel::ConcurrentQueue<FlushScheduleCommand>         mFlushScheduleCommands{};
     std::priority_queue<FlushDueEntry, std::vector<FlushDueEntry>, FlushDueEntryCompare> mFlushDueHeap{};
     FlushDueTokenMap                                                                     mFlushDueTokens{};
     std::uint64_t                                                                        mNextFlushToken{1};

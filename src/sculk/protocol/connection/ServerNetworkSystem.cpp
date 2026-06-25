@@ -322,30 +322,71 @@ void ServerNetworkSystem::scheduleSessionFlushAt(
     const RakNet::RakNetGUID&             guid,
     std::chrono::steady_clock::time_point due
 ) noexcept {
+    FlushScheduleCommand command{};
+    command.mKind = FlushScheduleCommand::Kind::Schedule;
+    command.mGuid = guid;
+    command.mDue  = due;
+
+    if (mFlushScheduleCommands.enqueue(command)) {
+        return;
+    }
+
     std::lock_guard lock{mFlushScheduleMutex};
-    const auto      token = mNextFlushToken++;
-    mFlushDueTokens[guid] = token;
-    mFlushDueHeap.push(
-        FlushDueEntry{
-            .mDue   = due,
-            .mGuid  = guid,
-            .mToken = token,
-        }
-    );
+    drainFlushScheduleCommandsUnlocked();
+    applyFlushScheduleCommandUnlocked(command);
 }
 
 void ServerNetworkSystem::cancelSessionFlush(const RakNet::RakNetGUID& guid) noexcept {
+    FlushScheduleCommand command{};
+    command.mKind = FlushScheduleCommand::Kind::Cancel;
+    command.mGuid = guid;
+
+    if (mFlushScheduleCommands.enqueue(command)) {
+        return;
+    }
+
     std::lock_guard lock{mFlushScheduleMutex};
-    (void)mFlushDueTokens.erase(guid);
+    drainFlushScheduleCommandsUnlocked();
+    applyFlushScheduleCommandUnlocked(command);
 }
 
 void ServerNetworkSystem::clearFlushSchedule() noexcept {
     std::lock_guard lock{mFlushScheduleMutex};
+    drainFlushScheduleCommandsUnlocked();
     while (!mFlushDueHeap.empty()) {
         mFlushDueHeap.pop();
     }
     mFlushDueTokens.clear();
     mNextFlushToken = 1;
+}
+
+void ServerNetworkSystem::drainFlushScheduleCommands() noexcept {
+    std::lock_guard lock{mFlushScheduleMutex};
+    drainFlushScheduleCommandsUnlocked();
+}
+
+void ServerNetworkSystem::drainFlushScheduleCommandsUnlocked() noexcept {
+    FlushScheduleCommand command{};
+    while (mFlushScheduleCommands.try_dequeue(command)) {
+        applyFlushScheduleCommandUnlocked(command);
+    }
+}
+
+void ServerNetworkSystem::applyFlushScheduleCommandUnlocked(const FlushScheduleCommand& command) noexcept {
+    if (command.mKind == FlushScheduleCommand::Kind::Schedule) {
+        const auto token               = mNextFlushToken++;
+        mFlushDueTokens[command.mGuid] = token;
+        mFlushDueHeap.push(
+            FlushDueEntry{
+                .mDue   = command.mDue,
+                .mGuid  = command.mGuid,
+                .mToken = token,
+            }
+        );
+        return;
+    }
+
+    (void)mFlushDueTokens.erase(command.mGuid);
 }
 
 Result<> ServerNetworkSystem::setOnConnected(ConnectionEventCallback&& callback) noexcept {
@@ -515,6 +556,8 @@ bool ServerNetworkSystem::flushTickOnce() noexcept {
     const auto  now               = std::chrono::steady_clock::now();
 
     while (processedReady < flushReadyPerTick) {
+        drainFlushScheduleCommands();
+
         FlushDueEntry entry{};
         {
             std::lock_guard lock{mFlushScheduleMutex};
