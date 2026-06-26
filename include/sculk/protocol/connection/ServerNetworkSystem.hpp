@@ -240,6 +240,8 @@ private:
 
     void waitForPendingSessionPacketTasks() noexcept;
 
+    void disconnectAllSessionsForTeardown() noexcept;
+
     template <typename F>
         requires std::invocable<F&> && std::is_nothrow_invocable_v<F&>
     bool submitFlushJob(F&& job) noexcept {

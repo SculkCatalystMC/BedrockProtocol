@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -26,28 +27,29 @@
 namespace sculk::protocol::SCULK_ABI_INLINE_NAMESPACE {
 
 class Session {
+    friend class ClientNetworkSystem;
+    friend class ServerNetworkSystem;
+
 public:
     using Buffer          = std::vector<std::byte>;
     using BufferView      = std::span<const std::byte>;
     using BatchedBuffer   = std::vector<Buffer>;
     using OutboundBuffers = std::vector<Buffer>;
 
-    explicit Session(RakNet::RakPeerInterface& peer, const RakNet::AddressOrGUID& remote) noexcept;
-
     ~Session();
 
 protected:
-    RakNet::RakPeerInterface&             mPeer;
-    RakNet::AddressOrGUID                 mRemote{};
-    std::deque<Buffer>                    mInboundPackets{};
-    std::deque<Buffer>                    mOutboundPackets{};
-    std::atomic_bool                      mConnected{};
-    std::optional<CompressionAlgorithm>   mCompressionType{};
-    std::int32_t                          mCompressionThreshold{};
-    std::optional<CryptoManager>          mEncryption{};
-    std::chrono::steady_clock::time_point mNextFlushAt{};
-    mutable std::mutex                    mInboundMutex{};
-    mutable std::mutex                    mOutboundMutex{};
+    std::atomic<RakNet::RakPeerInterface*> mPeer{};
+    RakNet::AddressOrGUID                  mRemote{};
+    std::deque<Buffer>                     mInboundPackets{};
+    std::deque<Buffer>                     mOutboundPackets{};
+    std::atomic_bool                       mConnected{};
+    std::optional<CompressionAlgorithm>    mCompressionType{};
+    std::int32_t                           mCompressionThreshold{};
+    std::optional<CryptoManager>           mEncryption{};
+    std::chrono::steady_clock::time_point  mNextFlushAt{};
+    mutable std::mutex                     mInboundMutex{};
+    mutable std::mutex                     mOutboundMutex{};
 
     Session(const Session&)            = delete;
     Session& operator=(const Session&) = delete;
@@ -100,7 +102,16 @@ public:
 
     [[nodiscard]] Result<BatchedBuffer> deserializeBatchPackets(std::span<const std::byte> batchedBuffer);
 
+    // Detaches transport peer during NetworkSystem teardown to prevent stale peer access from externally retained
+    // sessions.
+    void detachPeer() noexcept;
+
 private:
+    explicit Session(RakNet::RakPeerInterface* peer, const RakNet::AddressOrGUID& remote) noexcept;
+
+    [[nodiscard]] static std::shared_ptr<Session>
+    create(RakNet::RakPeerInterface* peer, const RakNet::AddressOrGUID& remote) noexcept;
+
     [[nodiscard]] bool flushPendingBeforeStateChangeUnlocked() noexcept;
 
     [[nodiscard]] bool dequeueOutboundPackets(OutboundBuffers& outPackets) noexcept;

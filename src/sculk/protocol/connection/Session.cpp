@@ -43,11 +43,19 @@ constexpr auto FLUSH_INTERVAL = std::chrono::milliseconds(20);
 
 } // namespace
 
-Session::Session(RakNet::RakPeerInterface& peer, const RakNet::AddressOrGUID& remote) noexcept
+Session::Session(RakNet::RakPeerInterface* peer, const RakNet::AddressOrGUID& remote) noexcept
 : mPeer(peer),
   mRemote(remote),
-  mConnected(true),
+  mConnected(peer != nullptr),
   mNextFlushAt(std::chrono::steady_clock::now() + FLUSH_INTERVAL) {}
+
+std::shared_ptr<Session> Session::create(RakNet::RakPeerInterface* peer, const RakNet::AddressOrGUID& remote) noexcept {
+    struct MakeSharedEnabler final : Session {
+        MakeSharedEnabler(RakNet::RakPeerInterface* p, const RakNet::AddressOrGUID& r) noexcept : Session(p, r) {}
+    };
+
+    return std::make_shared<MakeSharedEnabler>(peer, remote);
+}
 
 Session::~Session() { disconnect(); }
 
@@ -123,7 +131,8 @@ bool Session::flush() {
     {
         std::scoped_lock lock{mOutboundMutex};
         mNextFlushAt = std::chrono::steady_clock::now() + FLUSH_INTERVAL;
-        if (!mConnected.load(std::memory_order_relaxed) || mOutboundPackets.empty()) {
+        if (!mConnected.load(std::memory_order_relaxed) || !mPeer.load(std::memory_order_acquire)
+            || mOutboundPackets.empty()) {
             return false;
         }
         drainedPackets.swap(mOutboundPackets);
@@ -151,7 +160,8 @@ bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
         }
 
         mNextFlushAt = now + FLUSH_INTERVAL;
-        if (!mConnected.load(std::memory_order_relaxed) || mOutboundPackets.empty()) {
+        if (!mConnected.load(std::memory_order_relaxed) || !mPeer.load(std::memory_order_acquire)
+            || mOutboundPackets.empty()) {
             return false;
         }
         drainedPackets.swap(mOutboundPackets);
@@ -169,7 +179,8 @@ bool Session::flushIfDue(std::chrono::steady_clock::time_point now) noexcept {
 }
 
 bool Session::dequeueOutboundPackets(OutboundBuffers& outPackets) noexcept {
-    if (!mConnected.load(std::memory_order_relaxed) || mOutboundPackets.empty()) {
+    if (!mConnected.load(std::memory_order_relaxed) || !mPeer.load(std::memory_order_acquire)
+        || mOutboundPackets.empty()) {
         return false;
     }
 
@@ -213,7 +224,8 @@ bool Session::receivePacket(Buffer& outBuffer) noexcept {
 }
 
 bool Session::sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept {
-    if (!mConnected.load(std::memory_order_relaxed)) {
+    auto* peer = mPeer.load(std::memory_order_acquire);
+    if (!mConnected.load(std::memory_order_relaxed) || !peer) {
         return false;
     }
 
@@ -260,7 +272,7 @@ bool Session::sendBatchedBufferImmediately(Buffer&& packetsBuffer) noexcept {
     framed.push_back(static_cast<std::byte>(MINECRAFT_BATCH_PACKET_ID));
     framed.insert(framed.end(), finalBuffer.begin(), finalBuffer.end());
 
-    return mPeer.Send(
+    return peer->Send(
         reinterpret_cast<const char*>(framed.data()),
         static_cast<int>(framed.size()),
         HIGH_PRIORITY,
@@ -299,7 +311,13 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
         status.mOutboundQueueApprox = mOutboundPackets.size();
     }
 
-    if (mRemote.IsUndefined()) {
+    if (!status.mConnected) {
+        status.mConnectionState = NetworkStatus::ConnectionState::Disconnected;
+        return status;
+    }
+
+    auto* peer = mPeer.load(std::memory_order_acquire);
+    if (!peer || mRemote.IsUndefined()) {
         status.mConnectionState =
             status.mConnected ? NetworkStatus::ConnectionState::Unknown : NetworkStatus::ConnectionState::Disconnected;
         return status;
@@ -308,19 +326,19 @@ NetworkStatus Session::getNetworkStatus() const noexcept {
     auto resolvedRemote = mRemote;
     if (resolvedRemote.systemAddress == RakNet::UNASSIGNED_SYSTEM_ADDRESS
         && resolvedRemote.rakNetGuid != RakNet::UNASSIGNED_RAKNET_GUID) {
-        resolvedRemote.systemAddress = mPeer.GetSystemAddressFromGuid(resolvedRemote.rakNetGuid);
+        resolvedRemote.systemAddress = peer->GetSystemAddressFromGuid(resolvedRemote.rakNetGuid);
     }
 
-    const auto peerState    = mPeer.GetConnectionState(resolvedRemote);
+    const auto peerState    = peer->GetConnectionState(resolvedRemote);
     status.mConnectionState = mapConnectionState(peerState);
     status.mConnected       = status.mConnected && (peerState == RakNet::IS_CONNECTED);
 
-    status.mAveragePingMs = mPeer.GetAveragePing(resolvedRemote);
-    status.mLastPingMs    = mPeer.GetLastPing(resolvedRemote);
-    status.mLowestPingMs  = mPeer.GetLowestPing(resolvedRemote);
+    status.mAveragePingMs = peer->GetAveragePing(resolvedRemote);
+    status.mLastPingMs    = peer->GetLastPing(resolvedRemote);
+    status.mLowestPingMs  = peer->GetLowestPing(resolvedRemote);
 
     RakNet::RakNetStatistics transportStats{};
-    auto*                    stats = mPeer.GetStatistics(resolvedRemote.systemAddress, &transportStats);
+    auto*                    stats = peer->GetStatistics(resolvedRemote.systemAddress, &transportStats);
     if (!stats) {
         return status;
     }
@@ -383,8 +401,12 @@ void Session::disconnect() noexcept {
         return;
     }
 
-    mPeer.CloseConnection(mRemote, true, 0, IMMEDIATE_PRIORITY);
+    if (auto* peer = mPeer.load(std::memory_order_acquire)) {
+        peer->CloseConnection(mRemote, true, 0, IMMEDIATE_PRIORITY);
+    }
 }
+
+void Session::detachPeer() noexcept { mPeer.store(nullptr, std::memory_order_release); }
 
 bool Session::enqueueInboundPacket(Buffer&& buffer) noexcept {
     std::scoped_lock lock{mInboundMutex};

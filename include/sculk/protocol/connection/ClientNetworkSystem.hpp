@@ -151,6 +151,8 @@ private:
 
     void waitForPendingDelayedWakeups() noexcept;
 
+    void disconnectSessionForTeardown() noexcept;
+
     template <typename F>
         requires std::invocable<F&> && std::is_nothrow_invocable_v<F&>
     bool submitIoJob(F&& job) noexcept {

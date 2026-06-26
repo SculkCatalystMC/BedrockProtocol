@@ -248,42 +248,24 @@ Result<> ServerNetworkSystem::setFlushReadyPerTick(std::size_t maxReadyPerTick) 
 std::size_t ServerNetworkSystem::getFlushReadyPerTick() const noexcept { return mFlushReadyPerTick; }
 
 void ServerNetworkSystem::stop() {
-    if (!mRunning.exchange(false, std::memory_order_acq_rel)) {
-        return;
+    const bool wasRunning = mRunning.exchange(false, std::memory_order_acq_rel);
+
+    if (wasRunning) {
+        if (mIoPumpThread.joinable()) {
+            mIoPumpThread.request_stop();
+            mIoPumpThread.join();
+        }
+
+        waitForPendingFlushWakeups();
+        waitForPendingFlushJobs();
+        waitForPendingSessionPacketTasks();
+        clearFlushSchedule();
     }
 
-    if (mIoPumpThread.joinable()) {
-        mIoPumpThread.request_stop();
-        mIoPumpThread.join();
-    }
+    disconnectAllSessionsForTeardown();
 
-    waitForPendingFlushWakeups();
-    waitForPendingFlushJobs();
-    waitForPendingSessionPacketTasks();
-    clearFlushSchedule();
-
-    std::vector<std::shared_ptr<SessionContext>> contexts;
-    contexts.reserve(mSessionContexts.size());
-    mSessionContexts.for_each([&contexts](const SessionContextsMap::value_type& entry) {
-        contexts.push_back(entry.second);
-    });
-
-    for (const auto& context : contexts) {
-        context->mSession->disconnect();
-    }
-
-    std::vector<RakNet::RakNetGUID> contextKeys;
-    contextKeys.reserve(mSessionContexts.size());
-    mSessionContexts.for_each([&contextKeys](const SessionContextsMap::value_type& entry) {
-        contextKeys.push_back(entry.first);
-    });
-
-    for (const auto& key : contextKeys) {
-        (void)removeSessionContext(key);
-    }
-
-    if (mPeer) {
-        mPeer->Shutdown(20);
+    if (wasRunning && mPeer) {
+        mPeer->Shutdown(50);
     }
 }
 
@@ -719,6 +701,29 @@ void ServerNetworkSystem::waitForPendingSessionPacketTasks() noexcept {
     }
 }
 
+void ServerNetworkSystem::disconnectAllSessionsForTeardown() noexcept {
+    std::vector<std::shared_ptr<SessionContext>> contexts;
+    contexts.reserve(mSessionContexts.size());
+    mSessionContexts.for_each([&contexts](const SessionContextsMap::value_type& entry) {
+        contexts.push_back(entry.second);
+    });
+
+    for (const auto& context : contexts) {
+        context->mSession->disconnect();
+        context->mSession->detachPeer();
+    }
+
+    std::vector<RakNet::RakNetGUID> contextKeys;
+    contextKeys.reserve(mSessionContexts.size());
+    mSessionContexts.for_each([&contextKeys](const SessionContextsMap::value_type& entry) {
+        contextKeys.push_back(entry.first);
+    });
+
+    for (const auto& key : contextKeys) {
+        (void)removeSessionContext(key);
+    }
+}
+
 void ServerNetworkSystem::processIncomingPacket(detail::RakPacketOwner packetOwner) {
     auto&      packetRef      = *packetOwner.get();
     auto       callbacks      = mCallbacks.load(std::memory_order_acquire);
@@ -752,7 +757,7 @@ void ServerNetworkSystem::processIncomingPacket(detail::RakPacketOwner packetOwn
 
     if (messageId == DefaultMessageIDTypes::ID_NEW_INCOMING_CONNECTION) {
         auto newSessionContext                      = std::make_shared<SessionContext>();
-        newSessionContext->mSession                 = std::make_shared<Session>(*mPeer, remote);
+        newSessionContext->mSession                 = Session::create(mPeer.get(), remote);
         newSessionContext->mStrand                  = std::make_shared<thread::TaskStrand>(*mThreadPool);
         newSessionContext->mRawIngressWindowStart   = std::chrono::steady_clock::time_point{};
         newSessionContext->mRawIngressWindowPackets = 0;

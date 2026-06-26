@@ -68,22 +68,18 @@ NetworkStartResult ClientNetworkSystem::start() {
 }
 
 void ClientNetworkSystem::stop() {
-    if (!mRunning.exchange(false, std::memory_order_acq_rel)) {
-        return;
+    const bool wasRunning = mRunning.exchange(false, std::memory_order_acq_rel);
+
+    if (wasRunning) {
+        mIoPumpActive.store(false, std::memory_order_release);
+        waitForPendingDelayedWakeups();
+        waitForPendingIoJobs();
     }
 
-    mIoPumpActive.store(false, std::memory_order_release);
-    waitForPendingDelayedWakeups();
-    waitForPendingIoJobs();
+    disconnectSessionForTeardown();
 
-    auto session = mSession.load(std::memory_order_acquire);
-    if (session) {
-        session->disconnect();
-        mSession.store(nullptr, std::memory_order_release);
-    }
-
-    if (mPeer) {
-        mPeer->Shutdown(20);
+    if (wasRunning && mPeer) {
+        mPeer->Shutdown(50);
     }
 }
 
@@ -112,11 +108,7 @@ void ClientNetworkSystem::disconnect() {
     waitForPendingDelayedWakeups();
     waitForPendingIoJobs();
 
-    auto session = mSession.load(std::memory_order_acquire);
-    if (session) {
-        session->disconnect();
-        mSession.store(nullptr, std::memory_order_release);
-    }
+    disconnectSessionForTeardown();
 
     mRawIngressWindowStart   = {};
     mRawIngressWindowPackets = 0;
@@ -359,6 +351,17 @@ void ClientNetworkSystem::waitForPendingDelayedWakeups() noexcept {
     }
 }
 
+void ClientNetworkSystem::disconnectSessionForTeardown() noexcept {
+    auto session = mSession.load(std::memory_order_acquire);
+    if (!session) {
+        return;
+    }
+
+    session->disconnect();
+    session->detachPeer();
+    mSession.store(nullptr, std::memory_order_release);
+}
+
 void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
     auto callbacks = mCallbacks.load(std::memory_order_acquire);
 
@@ -430,7 +433,7 @@ void ClientNetworkSystem::processIncomingPacket(RakNet::Packet& packet) {
     const auto messageId = packet.data[0];
 
     if (messageId == DefaultMessageIDTypes::ID_CONNECTION_REQUEST_ACCEPTED) {
-        auto session = std::make_shared<Session>(*mPeer, RakNet::AddressOrGUID{&packet});
+        auto session = Session::create(mPeer.get(), RakNet::AddressOrGUID{&packet});
         mSession.store(session, std::memory_order_release);
         resetIngressWindow();
         if (callbacks->mOnConnected) {
